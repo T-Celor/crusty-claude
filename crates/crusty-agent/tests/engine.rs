@@ -285,7 +285,9 @@ impl Tool for ProjectWrite {
 #[tokio::test]
 async fn masked_secret_written_outside_the_project_is_asked() {
     let (vault, placeholder) = secret_vault();
-    let outside = std::env::temp_dir().join("crusty-outside-project").join("leak.txt");
+    // The test workspace is the temp directory, so the outside path must not be under it: a
+    // network share on Windows, a root-level folder elsewhere.
+    let outside = std::path::PathBuf::from(if cfg!(windows) { r"\\host\share\leak.txt" } else { "/crusty-outside-project/leak.txt" });
     let p = Scripted::new(vec![
         Step::Call("Write", json!({"content": placeholder, "file_path": outside.display().to_string()})),
         Step::Text("ok"),
