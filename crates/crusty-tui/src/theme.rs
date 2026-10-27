@@ -56,6 +56,7 @@ pub fn mode_color(mode: PermissionMode) -> Color {
         PermissionMode::Default => Color::White,
         PermissionMode::AcceptEdits => WARN,
         PermissionMode::Plan => Color::Blue,
+        PermissionMode::Auto => Color::Cyan,
         PermissionMode::BypassPermissions => ERR,
     }
 }

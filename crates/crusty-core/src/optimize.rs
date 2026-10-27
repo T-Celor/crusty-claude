@@ -51,6 +51,23 @@ pub trait RequestOptimizer: Send + Sync {
     /// error the request is left as it was and the route is `Direct`.
     async fn optimize(&self, req: &mut ChatRequest, ctx: &OptimizeContext) -> OptimizeOutcome;
 
+    /// Shortens one tool result before it joins the conversation (Triage of failed commands,
+    /// Rerank of search results). `goal` is what the calling agent works on. Must never
+    /// fail: anything removed stays retrievable, and on error `output` is left as it was.
+    async fn after_tool(
+        &self,
+        _tool: &str,
+        _input: &serde_json::Value,
+        _output: &mut crate::tool::ToolOutput,
+        _goal: &str,
+        _ctx: &OptimizeContext,
+    ) {
+    }
+
+    /// The conversation of `session_id` was replaced (`/clear`, `/resume`, `/rewind`): drop
+    /// any per-session state keyed by message positions (prune frontier, sticky routes).
+    fn forget_session(&self, _session_id: &str) {}
+
     /// Real usage of the answer, for calibration and measured savings.
     fn record_usage(&self, _ctx: &OptimizeContext, _outcome: &OptimizeOutcome, _usage: &Usage) {}
 

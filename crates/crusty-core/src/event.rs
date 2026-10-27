@@ -7,31 +7,47 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::advisor::AdviceSource;
+use crate::checkpoint::{CheckpointSummary, RewindScope};
 use crate::message::Usage;
 use crate::metrics::Metrics;
 use crate::permission::{ApprovalDecision, ApprovalRequest, PermissionMode};
 
 /// Optimization stages, in pipeline order. Also the order of the TUI side panel.
+/// Tool-output stages (RTK, triage, HTML→Markdown, rerank) run when a tool returns;
+/// request stages (prune, Headroom, DLP, gate, pxpipe) run before each model call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     Ponytail,
     Rtk,
+    /// Error blocks kept from a long failed build or test log.
+    Triage,
     HtmlToMarkdown,
+    /// Most relevant search fragments kept.
+    Rerank,
     Graphify,
+    /// Stale or irrelevant history replaced by retrievable stubs.
+    Prune,
     Headroom,
+    /// Secrets and personal data masked before sending (saves nothing; shown for trust).
+    Dlp,
     ContextGate,
     Pxpipe,
     Proxy,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 8] = [
+    pub const ALL: [Stage; 12] = [
         Stage::Ponytail,
         Stage::Rtk,
+        Stage::Triage,
         Stage::HtmlToMarkdown,
+        Stage::Rerank,
         Stage::Graphify,
+        Stage::Prune,
         Stage::Headroom,
+        Stage::Dlp,
         Stage::ContextGate,
         Stage::Pxpipe,
         Stage::Proxy,
@@ -41,14 +57,86 @@ impl Stage {
         match self {
             Stage::Ponytail => "Ponytail",
             Stage::Rtk => "RTK",
+            Stage::Triage => "Triage",
             Stage::HtmlToMarkdown => "HTML→MD",
+            Stage::Rerank => "Rerank",
             Stage::Graphify => "Graphify",
+            Stage::Prune => "Prune",
             Stage::Headroom => "Headroom",
+            Stage::Dlp => "DLP",
             Stage::ContextGate => "Gate",
             Stage::Pxpipe => "pxpipe",
             Stage::Proxy => "Proxy",
         }
     }
+}
+
+/// Where the advisor was asked something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvicePoint {
+    Command,
+    Write,
+    Secret,
+    Rerank,
+    Prune,
+    Triage,
+    Router,
+    Intent,
+    Auto,
+}
+
+impl AdvicePoint {
+    pub const ALL: [AdvicePoint; 9] = [
+        AdvicePoint::Command,
+        AdvicePoint::Write,
+        AdvicePoint::Secret,
+        AdvicePoint::Rerank,
+        AdvicePoint::Prune,
+        AdvicePoint::Triage,
+        AdvicePoint::Router,
+        AdvicePoint::Intent,
+        AdvicePoint::Auto,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AdvicePoint::Command => "commands",
+            AdvicePoint::Write => "writes",
+            AdvicePoint::Secret => "secrets",
+            AdvicePoint::Rerank => "rerank",
+            AdvicePoint::Prune => "prune",
+            AdvicePoint::Triage => "triage",
+            AdvicePoint::Router => "router",
+            AdvicePoint::Intent => "intent",
+            AdvicePoint::Auto => "auto",
+        }
+    }
+}
+
+/// One answer of the advisor, emitted by the advisor itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdviceInfo {
+    pub point: AdvicePoint,
+    pub source: AdviceSource,
+    /// `allow`, `review`, `block`, a tier, an intent, or `scored N`.
+    pub outcome: String,
+    pub confidence: Option<f64>,
+    pub latency_ms: u64,
+    /// Why Laya was not used, when the native fallback answered.
+    pub fallback_reason: Option<String>,
+}
+
+/// How commands are confined, reported once at start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SandboxInfo {
+    /// `landlock`, `bubblewrap`, `seatbelt`, `windows-restricted-token`, or `none`.
+    pub backend: String,
+    /// `off`, `workspace-write` or `read-only`.
+    pub mode: String,
+    pub network_blocked: bool,
+    pub available: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -298,6 +386,37 @@ pub enum AppEvent {
         agent_id: String,
         est_tokens: u64,
         window: u64,
+    },
+    /// Health of the Laya server, from the monitor.
+    AdvisorStatus {
+        url: String,
+        up: bool,
+        latency_ms: Option<u64>,
+        /// Model revisions reported by `/health`.
+        detail: Option<String>,
+    },
+    Advice(AdviceInfo),
+    /// Values masked in one outgoing request (counts of distinct values).
+    Redacted {
+        agent_id: String,
+        secrets: u64,
+        pii: u64,
+    },
+    Sandbox(SandboxInfo),
+    CheckpointCreated {
+        id: u32,
+        label: String,
+    },
+    /// Answer to `/rewind` without arguments: the UI shows a picker.
+    CheckpointList {
+        items: Vec<CheckpointSummary>,
+    },
+    Rewound {
+        id: u32,
+        scope: RewindScope,
+        files_restored: usize,
+        /// Files that could not be restored, with the reason.
+        failures: Vec<String>,
     },
     PermissionModeChanged {
         mode: PermissionMode,

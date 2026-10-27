@@ -71,6 +71,12 @@ fn shared_tail(rt: &Runtime, out: &mut String) {
     let ctx = rt.context();
     out.push_str("\n\n");
     out.push_str(&environment(rt));
+    if !ctx.skills.is_empty() {
+        out.push_str("\n\n# Skills\nLoad a skill with the Skill tool when the task matches:\n");
+        for skill in &ctx.skills {
+            let _ = writeln!(out, "- {skill}");
+        }
+    }
     if !ctx.memory.trim().is_empty() {
         out.push_str("\n\n");
         out.push_str(ctx.memory.trim());

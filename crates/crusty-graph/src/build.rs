@@ -5,17 +5,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use std::time::Instant;
 
 use crusty_core::config::GraphifyConfig;
 use ignore::WalkBuilder;
-use regex::Regex;
 use sha2::{Digest, Sha256};
 
 use crate::GraphError;
 use crate::analyze;
-use crate::extract::{Definition, Import, ImportKind, extract};
+use crate::extract::{Definition, Import, ImportKind, extract_file};
 use crate::lang::language_of;
 use crate::model::{Edge, EdgeKind, GRAPH_VERSION, Graph, Node, NodeKind, Provenance};
 
@@ -28,8 +26,6 @@ const MAX_REFERENCES_PER_FILE: usize = 200;
 /// Extensions tried after a relative module path, in order.
 const RELATIVE_SUFFIXES: &[&str] = &["", ".rb", ".h", ".hpp", ".php", ".sh", ".md"];
 const JS_EXTENSIONS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
-
-static IDENTIFIER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]{3,}").expect("valid literal regex"));
 
 /// Counts of one build.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -83,9 +79,16 @@ pub fn build_or_update(root: &Path, cfg: &GraphifyConfig, previous: Option<Graph
         };
         let hash = sha256_hex(text.as_bytes());
         let reused = old_hashes.get(&rel) == Some(&hash);
-        let extracted = extract(lang, &text, !reused);
-        let identifiers = IDENTIFIER.find_iter(&text).map(|m| m.as_str().to_owned()).collect();
-        scanned.push(Scanned { rel, lang, hash, reused, definitions: extracted.definitions, imports: extracted.imports, identifiers });
+        let extracted = extract_file(&rel, lang, &text, !reused);
+        scanned.push(Scanned {
+            rel,
+            lang,
+            hash,
+            reused,
+            definitions: extracted.definitions,
+            imports: extracted.imports,
+            identifiers: extracted.identifiers,
+        });
     }
 
     let files: BTreeSet<String> = scanned.iter().map(|s| s.rel.clone()).collect();

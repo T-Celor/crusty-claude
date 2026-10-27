@@ -37,10 +37,13 @@ pub enum Entry {
         message: Message,
         ts: DateTime<Utc>,
     },
-    /// Everything before this point was replaced by `summary`.
+    /// Everything before this point was replaced by `summary`, except the last `kept`
+    /// orchestrator messages (absent in older transcripts: 0).
     Compaction {
         summary: String,
         replaced: usize,
+        #[serde(default)]
+        kept: usize,
         ts: DateTime<Utc>,
     },
     Title {
@@ -50,6 +53,12 @@ pub enum Entry {
         input_tokens: u64,
         output_tokens: u64,
         cost_usd: f64,
+        ts: DateTime<Utc>,
+    },
+    /// The conversation was rewound (`/rewind`): only the first `keep_messages` orchestrator
+    /// messages stay.
+    Rewind {
+        keep_messages: usize,
         ts: DateTime<Utc>,
     },
 }
@@ -155,11 +164,24 @@ pub fn load(path: &Path) -> io::Result<LoadedSession> {
                     session.messages.push(message);
                 }
             }
-            Entry::Compaction { summary, .. } => {
+            Entry::Compaction { summary, kept, .. } => {
+                // The kept tail stays verbatim; the summary joins its first message, as in memory.
+                let tail_start = session.messages.len().saturating_sub(kept);
+                let tail = session.messages.split_off(tail_start);
                 session.messages.clear();
-                session.messages.push(Message::user_text(format!("{SUMMARY_HEADER}{summary}")));
+                let summary_block = ContentBlock::text(format!("{SUMMARY_HEADER}{summary}"));
+                match tail.split_first() {
+                    Some((first, rest)) => {
+                        let mut first = first.clone();
+                        first.content.insert(0, summary_block);
+                        session.messages.push(first);
+                        session.messages.extend(rest.iter().cloned());
+                    }
+                    None => session.messages.push(Message { role: Role::User, content: vec![summary_block] }),
+                }
             }
             Entry::Title { title } => session.title = Some(title),
+            Entry::Rewind { keep_messages, .. } => session.messages.truncate(keep_messages),
             Entry::Usage { .. } => {}
         }
     }
@@ -337,13 +359,35 @@ mod tests {
         let mut t = Transcript::create(dir.path(), "c1", dir.path()).unwrap();
         t.append(&msg("orchestrator", Message::user_text("one"))).unwrap();
         t.append(&msg("orchestrator", Message::assistant_text("two"))).unwrap();
-        t.append(&Entry::Compaction { summary: "earlier work".into(), replaced: 2, ts: Utc::now() }).unwrap();
+        t.append(&Entry::Compaction { summary: "earlier work".into(), replaced: 2, kept: 0, ts: Utc::now() }).unwrap();
         t.append(&msg("orchestrator", Message::user_text("three"))).unwrap();
 
         let loaded = load(t.path()).unwrap();
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].text(), "[Conversation summary]\nearlier work");
         assert_eq!(loaded.messages[1].text(), "three");
+    }
+
+    #[test]
+    fn compaction_keeps_the_tail_on_resume() {
+        let dir = tempdir().unwrap();
+        let mut t = Transcript::create(dir.path(), "c4", dir.path()).unwrap();
+        t.append(&msg("orchestrator", Message::user_text("one"))).unwrap();
+        t.append(&msg("orchestrator", Message::assistant_text("two"))).unwrap();
+        t.append(&msg("orchestrator", Message::user_text("three"))).unwrap();
+        t.append(&msg("orchestrator", Message::assistant_text("four"))).unwrap();
+        t.append(&Entry::Compaction { summary: "earlier".into(), replaced: 2, kept: 2, ts: Utc::now() }).unwrap();
+        t.append(&msg("orchestrator", Message::user_text("five"))).unwrap();
+
+        let loaded = load(t.path()).unwrap();
+        // Kept tail: "three" and "four"; the summary joins "three", then "five" follows.
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(loaded.messages[0].role, Role::User);
+        assert_eq!(loaded.messages[0].content[0].as_text(), Some("[Conversation summary]\nearlier"));
+        assert!(loaded.messages[0].text().starts_with("[Conversation summary]\nearlier"));
+        assert!(loaded.messages[0].text().ends_with("three"));
+        assert_eq!(loaded.messages[1].text(), "four");
+        assert_eq!(loaded.messages[2].text(), "five");
     }
 
     #[test]
@@ -358,6 +402,20 @@ mod tests {
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.warnings.len(), 1);
         assert!(loaded.warnings[0].starts_with("line 3"));
+    }
+
+    #[test]
+    fn rewind_truncates_to_kept_messages() {
+        let dir = tempdir().unwrap();
+        let mut t = Transcript::create(dir.path(), "c3", dir.path()).unwrap();
+        t.append(&msg("orchestrator", Message::user_text("one"))).unwrap();
+        t.append(&msg("orchestrator", Message::assistant_text("two"))).unwrap();
+        t.append(&msg("orchestrator", Message::user_text("three"))).unwrap();
+        t.append(&Entry::Rewind { keep_messages: 1, ts: Utc::now() }).unwrap();
+        t.append(&msg("orchestrator", Message::user_text("four"))).unwrap();
+
+        let loaded = load(t.path()).unwrap();
+        assert_eq!(loaded.messages, vec![Message::user_text("one"), Message::user_text("four")]);
     }
 
     #[test]

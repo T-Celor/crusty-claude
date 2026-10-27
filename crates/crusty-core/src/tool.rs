@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::advisor::{Advisor, NoAdvisor};
+use crate::checkpoint::{Checkpointer, NoCheckpoints};
 use crate::config::Config;
 use crate::event::EventSink;
 use crate::filter::{ContentFilter, NoFilter};
@@ -45,10 +47,18 @@ pub struct ToolContext {
     pub config: Arc<Config>,
     /// RTK and HTML→Markdown filters (see `filter::choose_filtered`).
     pub filters: Arc<dyn ContentFilter>,
+    /// Laya or the native heuristics: reranking, log triage.
+    pub advisor: Arc<dyn Advisor>,
+    /// File snapshots for `/rewind`; file-changing tools call it before writing.
+    pub checkpoints: Arc<dyn Checkpointer>,
+    /// What the calling agent is working on (the user's prompt, or the delegated task),
+    /// used to rank search results and log blocks.
+    pub goal: Arc<str>,
 }
 
 impl ToolContext {
-    /// A context for tests: workspace `dir`, default config, no event consumer.
+    /// A context for tests: workspace `dir`, default config, no event consumer, no
+    /// advisor, no checkpoints.
     pub fn for_tests(dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         let dir = dir.canonicalize().unwrap_or(dir);
@@ -62,8 +72,21 @@ impl ToolContext {
             store: Arc::new(OriginalStore::default()),
             config: Arc::new(Config::default()),
             filters: Arc::new(NoFilter),
+            advisor: Arc::new(NoAdvisor),
+            checkpoints: Arc::new(NoCheckpoints),
+            goal: Arc::from(""),
         }
     }
+}
+
+/// The file change a call would make, computed before it runs (for the write guard and
+/// the approval preview).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedChange {
+    pub path: PathBuf,
+    /// Current content; `None` when the file does not exist yet.
+    pub before: Option<String>,
+    pub after: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +180,13 @@ pub trait Tool: Send + Sync {
             Some(s) => format!("{}({})", self.name(), preview_of(&s)),
             None => self.name().to_owned(),
         }
+    }
+
+    /// For file-changing tools: the change this call would make, without making it.
+    /// `None` when the tool changes no file or the change cannot be computed (the call
+    /// itself will then report the error).
+    fn planned_change(&self, _input: &Value, _ctx: &ToolContext) -> Option<PlannedChange> {
+        None
     }
 
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;

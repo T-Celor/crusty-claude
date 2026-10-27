@@ -10,6 +10,7 @@ use std::time::Duration;
 use crusty_core::EventSink;
 use crusty_core::config::McpServerConfig;
 use crusty_core::tool::Tool;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::ServiceExt;
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -17,6 +18,7 @@ use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 
 use crate::config::expand_server;
 use crate::convert;
+use crate::sse::SseClientTransport;
 use crate::tool::McpTool;
 
 /// Tool-call timeout when the server config sets none.
@@ -28,7 +30,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerStatus {
     pub name: String,
-    /// `stdio`, `http` or `invalid` (neither `command` nor `url`).
+    /// `stdio`, `http`, `sse` or `invalid` (neither `command` nor `url`).
     pub transport: String,
     pub connected: bool,
     pub tools: usize,
@@ -150,7 +152,9 @@ fn drop_duplicate_tools(connections: &mut [Connection]) -> Vec<String> {
 }
 
 fn transport_label(server: &McpServerConfig) -> &'static str {
-    if server.command.is_some() {
+    if server.transport.as_deref() == Some("sse") {
+        "sse"
+    } else if server.command.is_some() {
         "stdio"
     } else if server.url.is_some() {
         "http"
@@ -213,6 +217,13 @@ async fn connect_one(
 
 /// Spawns the child process or opens the HTTP session and completes the initialise handshake.
 async fn start_transport(server: &McpServerConfig) -> Result<RunningService<RoleClient, ()>, String> {
+    if server.transport.as_deref() == Some("sse") {
+        let raw = server.url.as_deref().ok_or("`sse` transport needs a `url`")?;
+        let url = reqwest::Url::parse(raw).map_err(|e| format!("invalid url `{raw}`: {e}"))?;
+        let headers: HeaderMap = collect_headers::<HeaderName, HeaderValue>(&server.headers)?.into_iter().collect();
+        let transport = SseClientTransport::connect(url, headers).await.map_err(|e| format!("cannot open SSE stream: {e}"))?;
+        return ().serve(transport).await.map_err(|e| format!("initialise failed: {e}"));
+    }
     match (server.command.as_deref(), server.url.as_deref()) {
         (Some(command), _) => {
             let mut cmd = tokio::process::Command::new(resolve_command(command));

@@ -2,6 +2,7 @@
 //! mapping and the cancellable SSE body loop.
 
 use std::pin::pin;
+use std::sync::Arc;
 
 use crusty_core::config::ProviderConfig;
 use crusty_core::{CallOptions, CancellationToken, ProviderError};
@@ -9,6 +10,45 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use crate::sse::{SseEvent, SseParser};
+
+/// Looks up a configuration value by name. Production reads the process environment; tests
+/// inject a map, so no test touches real variables.
+pub(crate) type EnvFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Environment of the running process.
+pub(crate) fn process_env() -> EnvFn {
+    Arc::new(|name: &str| std::env::var(name).ok())
+}
+
+/// `value` when it is not blank.
+pub(crate) fn non_blank(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
+/// Environment lookup over fixed pairs.
+#[cfg(test)]
+pub(crate) fn test_env(pairs: &[(&str, &str)]) -> EnvFn {
+    let map: std::collections::BTreeMap<String, String> = pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+    Arc::new(move |name: &str| map.get(name).cloned())
+}
+
+/// A minimal Messages stream that answers with `text`.
+#[cfg(test)]
+pub(crate) fn test_sse(text: &str) -> String {
+    use serde_json::json;
+    let events = [
+        (
+            "message_start",
+            json!({"type": "message_start", "message": {"id": "msg_1", "model": "m", "usage": {"input_tokens": 3, "output_tokens": 1}}}),
+        ),
+        ("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})),
+        ("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})),
+        ("content_block_stop", json!({"type": "content_block_stop", "index": 0})),
+        ("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}})),
+        ("message_stop", json!({"type": "message_stop"})),
+    ];
+    events.iter().map(|(name, data)| format!("event: {name}\ndata: {data}\n\n")).collect()
+}
 
 /// Largest error body read before giving up on a parsed message.
 const ERROR_BODY_LIMIT: usize = 64 * 1024;

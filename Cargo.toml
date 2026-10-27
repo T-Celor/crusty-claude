@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -26,6 +26,11 @@ crusty-session = { path = "crates/crusty-session" }
 crusty-agent = { path = "crates/crusty-agent" }
 crusty-proxy = { path = "crates/crusty-proxy" }
 crusty-tui = { path = "crates/crusty-tui" }
+crusty-sandbox = { path = "crates/crusty-sandbox" }
+crusty-dlp = { path = "crates/crusty-dlp" }
+crusty-advisor = { path = "crates/crusty-advisor" }
+crusty-laya = { path = "crates/crusty-laya" }
+crusty-acp = { path = "crates/crusty-acp" }
 
 # async runtime
 tokio = { version = "1.54", features = ["full"] }
@@ -75,6 +80,31 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 similar = "2"
 shlex = "1"
+
+# v0.2: providers (SigV4 for Bedrock, exact local token counts for OpenAI models)
+hmac = "0.12"
+tiktoken-rs = "0.12"
+
+# v0.2: code graph parsers
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+
+# v0.2: pxpipe glyphs beyond Latin (GNU Unifont data, OFL-1.1 / GPL-2+ with font exception)
+unifont = "1.1"
+
+# v0.2: OS sandbox backends
+landlock = "0.4"
+win32job = "2"
+
+# v0.2: IDE integration (Agent Client Protocol schema)
+agent-client-protocol-schema = "1.12"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

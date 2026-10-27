@@ -3,6 +3,11 @@
 //! An image costs width × height / 750 tokens whatever text it holds, so dense text gets
 //! cheaper as an image. The rendering is lossy for byte-exact values, which is why the
 //! verbatim risk and the factsheet travel with every imaged block.
+//!
+//! Glyphs come from noto-sans-mono-bitmap first (Latin), then from GNU Unifont for the rest of
+//! the Basic Multilingual Plane. Unifont glyphs are drawn unscaled and left-aligned: halfwidth
+//! ones take one cell, fullwidth ones two. Right-to-left scripts, combining marks and scripts
+//! that need shaping are drawn by neither font correctly, so blocks containing them stay text.
 
 use std::collections::HashSet;
 
@@ -11,7 +16,8 @@ use base64::engine::general_purpose::STANDARD;
 use crusty_core::config::PxpipeConfig;
 use crusty_core::message::{ChatRequest, ContentBlock, Role, blocks_text};
 use crusty_core::tokens::{estimate_text, image_tokens};
-use noto_sans_mono_bitmap::{FontWeight, RasterHeight, get_raster, get_raster_width};
+use noto_sans_mono_bitmap::{FontWeight, RasterHeight, RasterizedChar, get_raster, get_raster_width};
+use unifont::Glyph as UnifontGlyph;
 
 const FONT_WEIGHT: FontWeight = FontWeight::Regular;
 const FONT_SIZE: RasterHeight = RasterHeight::Size16;
@@ -203,7 +209,61 @@ fn skipped(req: &ChatRequest, reason: &str) -> PxpipeResult {
 /// True when every character of `text` has a glyph, after the tab and newline handling of
 /// [`render_pages`]. Text that fails this is kept as text rather than imaged.
 fn fully_renderable(text: &str) -> bool {
-    text.chars().all(|c| matches!(c, '\r' | '\n' | '\t') || get_raster(c, FONT_WEIGHT, FONT_SIZE).is_some())
+    text.chars().all(|c| matches!(c, '\r' | '\n' | '\t') || ink_of(c).is_some())
+}
+
+/// The ink of one character: a noto glyph, or a Unifont glyph where noto has none.
+enum Ink {
+    Noto(RasterizedChar),
+    Unifont(&'static UnifontGlyph),
+}
+
+impl Ink {
+    /// Cells the character advances: two for a fullwidth Unifont glyph, otherwise one.
+    fn cells(&self) -> usize {
+        match self {
+            Ink::Noto(_) => 1,
+            Ink::Unifont(glyph) if glyph.is_fullwidth() => 2,
+            Ink::Unifont(_) => 1,
+        }
+    }
+}
+
+/// Glyph of `c`, noto first so Latin output is unchanged. `None` for characters that are
+/// not drawn (see [`unshaped`]) and for characters neither font has.
+fn ink_of(c: char) -> Option<Ink> {
+    if unshaped(c) {
+        return None;
+    }
+    get_raster(c, FONT_WEIGHT, FONT_SIZE).map(Ink::Noto).or_else(|| unifont::get_glyph(c).map(Ink::Unifont))
+}
+
+/// Characters that cannot be drawn correctly one glyph at a time: right-to-left scripts
+/// (drawn in logical order they read backwards, and there is no shaping), combining and
+/// zero-width marks (drawn as spacing glyphs), and scripts that need shaping (Indic, Thai,
+/// Lao, Myanmar, Khmer, Hangul conjoining jamo). Blocks containing them stay text.
+fn unshaped(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0300..=0x036F
+            | 0x0483..=0x0489
+            | 0x0590..=0x08FF
+            | 0x0900..=0x0DFF
+            | 0x0E00..=0x0EFF
+            | 0x1000..=0x109F
+            | 0x1100..=0x11FF
+            | 0x1780..=0x17FF
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0x20D0..=0x20FF
+            | 0xFB1D..=0xFDFF
+            | 0xFE00..=0xFE0F
+            | 0xFE20..=0xFE2F
+            | 0xFE70..=0xFEFF
+    )
 }
 
 /// Renders `text` as monospace pages of `width` × `height` pixels, wrapping at the columns.
@@ -271,29 +331,47 @@ impl Canvas {
     }
 
     fn put(&mut self, ch: char) {
-        if self.col == self.cols {
+        let ink = ink_of(ch).or_else(|| ink_of('?'));
+        let cells = ink.as_ref().map_or(1, Ink::cells);
+        if self.col + cells > self.cols {
             self.newline();
         }
         while self.row >= self.rows {
             self.close_page(self.rows);
             self.row -= self.rows;
         }
-        self.draw(ch);
-        self.col += 1;
+        if let Some(ink) = &ink {
+            self.draw(ink, cells);
+        }
+        self.col += cells;
         self.used_rows = self.used_rows.max(self.row + 1);
         self.chars += 1;
     }
 
-    fn draw(&mut self, ch: char) {
-        let glyph = get_raster(ch, FONT_WEIGHT, FONT_SIZE).or_else(|| get_raster('?', FONT_WEIGHT, FONT_SIZE));
-        let Some(glyph) = glyph else { return };
+    /// Draws `ink` at the cursor, spanning `cells` cells. Unifont glyphs are not scaled.
+    fn draw(&mut self, ink: &Ink, cells: usize) {
         let base_x = self.col * self.cell_w;
         let base_y = self.row * CELL_H;
-        for (gy, line) in glyph.raster().iter().take(CELL_H).enumerate() {
-            let start = (base_y + gy) * self.px_w + base_x;
-            for (gx, &ink) in line.iter().take(self.cell_w).enumerate() {
-                if let Some(px) = self.pixels.get_mut(start + gx) {
-                    *px = (*px).min(255 - ink);
+        match ink {
+            Ink::Noto(glyph) => {
+                for (gy, line) in glyph.raster().iter().take(CELL_H).enumerate() {
+                    let start = (base_y + gy) * self.px_w + base_x;
+                    for (gx, &ink) in line.iter().take(self.cell_w).enumerate() {
+                        if let Some(px) = self.pixels.get_mut(start + gx) {
+                            *px = (*px).min(255 - ink);
+                        }
+                    }
+                }
+            }
+            Ink::Unifont(glyph) => {
+                let span = cells * self.cell_w;
+                for gy in 0..CELL_H {
+                    for gx in 0..glyph.get_width().min(span) {
+                        let index = (base_y + gy) * self.px_w + base_x + gx;
+                        if let Some(px) = self.pixels.get_mut(index).filter(|_| glyph.get_pixel(gx, gy)) {
+                            *px = 0;
+                        }
+                    }
                 }
             }
         }
@@ -578,6 +656,40 @@ mod tests {
         assert!(!fully_renderable(&text));
         let r = PxpipeRenderer::new(PxpipeConfig::default()).transform(&request_with_result(&text));
         assert_eq!((r.applied, r.blocks_imaged), (false, 0));
+    }
+
+    #[test]
+    fn unifont_scripts_are_renderable_and_drawn() {
+        let text = "中文 かなカナ 한국어 Привет Ελληνικά ┌─┐ → ←\n".repeat(50);
+        assert!(fully_renderable(&text));
+        assert!(!render_pages(&text, PAGE, PAGE).is_empty());
+    }
+
+    #[test]
+    fn fullwidth_glyph_takes_two_cells() {
+        // "中a": the 'a' must sit where a plain "a" would sit two cells to the right.
+        let cw = get_raster_width(FONT_WEIGHT, FONT_SIZE);
+        let mut wide = Canvas::new(8, 1, cw);
+        wide.put('中');
+        wide.put('a');
+        assert_eq!(wide.col, 3);
+        let mut plain = Canvas::new(8, 1, cw);
+        plain.put('a');
+        for y in 0..CELL_H {
+            let row_wide = &wide.pixels[y * wide.px_w..(y + 1) * wide.px_w];
+            let row_plain = &plain.pixels[y * plain.px_w..(y + 1) * plain.px_w];
+            assert_eq!(&row_wide[2 * cw..3 * cw], &row_plain[..cw], "row {y}");
+        }
+    }
+
+    #[test]
+    fn rtl_marks_and_unassigned_characters_stay_text() {
+        assert!(!fully_renderable("مرحبا"));
+        assert!(!fully_renderable("שלום"));
+        assert!(!fully_renderable("e\u{0301}"));
+        assert!(!fully_renderable("\u{10FFFD}"), "unassigned plane 16 code point");
+        assert!(!fully_renderable("\u{1F600}"));
+        assert!(fully_renderable("plain ASCII and Ü ß"));
     }
 
     #[test]

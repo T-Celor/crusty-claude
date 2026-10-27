@@ -20,7 +20,7 @@ déléguer à l'outil d'origine. Le mode natif est le défaut : aucun composant 
 
 ## Graphify
 
-- Natif (`crusty-graph`) : index incrémental (hachage SHA-256 par fichier) de Rust, Python,
+- Natif (`crusty-graph`) : parseurs tree-sitter (Rust, Python, JS/TS, Go, Java, C/C++…), repli par expressions régulières ; index incrémental (hachage SHA-256 par fichier) de Rust, Python,
   JS/TS, Go, Java, Kotlin, C/C++, C#, Ruby, PHP, Swift, Scala, Lua, shell et Markdown ; arêtes
   extraites (contient, importe) et inférées (références), communautés par propagation d'étiquettes
   déterministe, nœuds centraux, liens surprenants. Outil `Graph` (find, explain, neighbors, path,
@@ -51,7 +51,7 @@ plafond de pages. Déterministe ; le temps est passé en paramètre (tests repro
 ## pxpipe
 
 - Natif (`crusty-gate::pxpipe`) : rendu des anciens blocs denses en PNG niveaux de gris avec la
-  police Noto Sans Mono 16 px, dernière page recadrée, note indiquant ce qui est imagé et fiche des
+  police Noto Sans Mono 16 px (repli GNU Unifont pour les écritures non latines), dernière page recadrée, note indiquant ce qui est imagé et fiche des
   valeurs exactes (hachages, UUID, nombres longs) gardée en texte.
 - Externe : `[optimizer.pxpipe] mode = "external"` route la requête vers un proxy pxpipe
   (`external_url`, par défaut `http://127.0.0.1:47821`) quand le gate le décide ; le dry-run natif
@@ -63,6 +63,38 @@ Texte de la politique (MIT, © 2026 DietrichGebert, version 5.3.2) injecté dans
 de **chaque** agent ; niveaux `lite`, `full`, `ultra` ; `/ponytail` le change à chaud. Les règles
 de sécurité de Crusty priment sur la politique.
 
+## Laya (`crusty-laya`, repli `crusty-advisor`)
+
+Client de `laya-serve` (`POST /v1/systemone`, questions `noul`, `choice`, `score` ; santé, latence,
+lots). Chaque point B0–B10 a un repli natif déterministe, utilisé si Laya est désactivé,
+injoignable, trop lent ou sous `min_confidence`. Laya ne peut que durcir une décision de sécurité.
+
+| Point | Rôle | Config |
+|---|---|---|
+| Garde | juge les commandes Bash et les écritures sensibles : `allow` / `review` / `block` | `[laya.guard]` `commands`, `files`, `sensitive_paths` |
+| DLP sortant | secrets et PII masqués en `⟦SECRET_n⟧` avant l'envoi à l'API, restaurés localement dans les entrées d'outils et l'affichage | `[laya.dlp]` `secrets`, `pii`, `ambiguous_threshold`, `rehydrate`, `allow_values` |
+| Reranker | trie les résultats de Grep, Glob et Graph | `[laya.rerank]` `min_items`, `keep` |
+| Épurateur | remplace les anciens résultats d'outils périmés (par lots, cache stable, récupérables par `Retrieve`) | `[laya.pruner]` `keep_recent_messages`, `min_relevance`, `batch_messages` |
+| Triage | garde les blocs d'erreur des logs de build/test en échec | `[laya.triage]` `min_lines`, `max_blocks`, `context_lines` |
+| Routeur de modèles | classe le prompt (trivial / routine / hard / research) vers Haiku / Sonnet / Opus, sauf si `--model` ou `/model` fixe le modèle ; `/model auto` revient au routage | `[laya.router]` `every_prompt`, `min_confidence`, `tiers` |
+| Intention | diffère les outils MCP non pertinents, chargés à la demande par l'outil `ToolSearch` | `[laya.intent]` `defer_mcp_tools`, `min_relevance`, `always_load` |
+| Complétion TUI | `@fichiers`, `/commandes`, historique | — |
+| Mode `auto` | continue sans validation humaine quand la confiance est suffisante | `[laya.auto_mode]` `threshold` |
+
+Statistiques de l'advisor dans le panneau latéral. Le DLP vit dans `crusty-dlp`. Règles de
+sécurité : [security.md](security.md).
+
+## Éditeurs (ACP)
+
+`crusty acp` : Agent Client Protocol sur stdio (Zed, JetBrains, Neovim, Emacs). Sessions
+persistées, approbations passées par l'éditeur. Non testé de bout en bout avec un vrai éditeur.
+
+## Skills et plugins
+
+Skills : dossiers `SKILL.md`, outil `Skill`, `/skills` (`[skills]`). Plugins : `plugin.json`
+(commandes, agents, skills, hooks, MCP), `crusty plugin list|install|remove` (`[plugins]`) ;
+plugins de projet seulement après `crusty trust`.
+
 ## Proxies externes
 
 Toute entrée `[[proxy.upstreams]]` est sondée (`health_path`, `stats_path`) et affichée dans le
@@ -71,7 +103,7 @@ panneau ; `via_proxy` ou `/proxy route` y envoie un fournisseur. Exemples : Head
 
 ## MCP
 
-SDK officiel `rmcp` : serveurs stdio et HTTP streamable depuis `[mcp.servers]`, `.mcp.json`
+SDK officiel `rmcp` : serveurs stdio, HTTP streamable et SSE historique depuis `[mcp.servers]`, `.mcp.json`
 (projet de confiance) et `--mcp-config`. Outils nommés `mcp__<serveur>__<outil>`, toujours soumis
 aux permissions (règle `mcp__serveur` pour les autoriser), délai par appel.
 
@@ -81,4 +113,6 @@ aux permissions (règle `mcp__serveur` pour les autoriser), délai par appel.
 |---|---|---|
 | `anthropic` | API Anthropic et proxies compatibles | `anthropic-version` 2026-10-21 (sans paramètres d'échantillonnage), réflexion adaptative, effort, cache de prompt automatique (≤ 4 marqueurs), `eager_input_streaming` hors proxy, replis serveur sur les modèles qui le permettent, `count_tokens`, liaison de réflexion tolérante aux réécritures |
 | `openai` | OpenAI, OpenRouter, Gemini (endpoint OpenAI), Ollama, vLLM, LM Studio | outils au format function calling, images en data URL, usage avec cache |
+| `bedrock` | Amazon Bedrock | signatures SigV4 ou jeton bearer |
+| `vertex` | Google Vertex AI | identifiants par défaut (ADC) |
 | `mock` | tests et démo hors ligne | réponses scriptées ou écho |

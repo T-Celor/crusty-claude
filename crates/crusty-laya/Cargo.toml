@@ -1,0 +1,24 @@
+[package]
+name = "crusty-laya"
+description = "Laya advisor: laya-serve client with native fallback and health monitoring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+crusty-core = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

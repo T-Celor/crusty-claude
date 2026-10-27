@@ -6,7 +6,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::event::{AppEvent, GateInfo, Stage, StageStatus};
+use crate::advisor::AdviceSource;
+use crate::event::{AdvicePoint, AppEvent, GateInfo, SandboxInfo, Stage, StageStatus};
 use crate::message::Usage;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -89,6 +90,28 @@ pub struct GraphView {
     pub duration_ms: u64,
 }
 
+/// Answers of the advisor at one integration point.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdviceTotals {
+    pub laya: u64,
+    pub native: u64,
+    pub abstained: u64,
+    /// `review` or `block` verdicts.
+    pub escalations: u64,
+    pub latency_ms_sum: u64,
+    pub last_outcome: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdvisorView {
+    pub url: String,
+    pub up: bool,
+    pub latency_ms: Option<u64>,
+    pub detail: Option<String>,
+    pub points: BTreeMap<AdvicePoint, AdviceTotals>,
+    pub last_fallback_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub stages: BTreeMap<Stage, StageTotals>,
@@ -105,12 +128,25 @@ pub struct MetricsSnapshot {
     pub model_fallbacks: u64,
     pub tool_calls: u64,
     pub tool_errors: u64,
+    pub advisor: AdvisorView,
+    /// Distinct values masked per request, summed.
+    pub redacted_secrets: u64,
+    pub redacted_pii: u64,
+    pub sandbox: Option<SandboxInfo>,
+    pub checkpoints: u64,
+    pub rewinds: u64,
 }
 
 impl MetricsSnapshot {
     /// Estimated tokens saved by every applied stage.
     pub fn total_saved_est(&self) -> i64 {
         self.stages.values().map(StageTotals::saved_est).sum()
+    }
+
+    /// Real tokens saved, from the stages that have real measurements.
+    pub fn total_saved_real(&self) -> Option<i64> {
+        let measured: Vec<&StageTotals> = self.stages.values().filter(|t| t.real_samples > 0).collect();
+        (!measured.is_empty()).then(|| measured.iter().map(|t| t.tokens_before_real as i64 - t.tokens_after_real as i64).sum())
     }
 }
 
@@ -220,6 +256,37 @@ impl Metrics {
                     p.stats.clone_from(stats);
                 }
             }
+            AppEvent::AdvisorStatus { url, up, latency_ms, detail } => {
+                s.advisor.url.clone_from(url);
+                s.advisor.up = *up;
+                s.advisor.latency_ms = *latency_ms;
+                if detail.is_some() {
+                    s.advisor.detail.clone_from(detail);
+                }
+            }
+            AppEvent::Advice(a) => {
+                if a.fallback_reason.is_some() {
+                    s.advisor.last_fallback_reason.clone_from(&a.fallback_reason);
+                }
+                let t = s.advisor.points.entry(a.point).or_default();
+                match a.source {
+                    AdviceSource::Laya => t.laya += 1,
+                    AdviceSource::Native => t.native += 1,
+                    AdviceSource::None => t.abstained += 1,
+                }
+                if a.outcome == "review" || a.outcome == "block" {
+                    t.escalations += 1;
+                }
+                t.latency_ms_sum += a.latency_ms;
+                t.last_outcome.clone_from(&a.outcome);
+            }
+            AppEvent::Redacted { secrets, pii, .. } => {
+                s.redacted_secrets += secrets;
+                s.redacted_pii += pii;
+            }
+            AppEvent::Sandbox(info) => s.sandbox = Some(info.clone()),
+            AppEvent::CheckpointCreated { .. } => s.checkpoints += 1,
+            AppEvent::Rewound { .. } => s.rewinds += 1,
             AppEvent::AgentSpawned { .. } => s.agents_spawned += 1,
             AppEvent::ModelFallback { .. } => s.model_fallbacks += 1,
             AppEvent::ToolFinished { ok, .. } => {
@@ -265,6 +332,34 @@ mod tests {
         assert_eq!(snap.usage_by_model["p:x"].calls, 2);
         assert_eq!(snap.total_usage.input_tokens, 20);
         assert!((snap.total_cost_usd - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn advice_is_counted_per_point_and_source() {
+        use crate::event::AdviceInfo;
+        let m = Metrics::default();
+        let advice = |source, outcome: &str| {
+            AppEvent::Advice(AdviceInfo {
+                point: AdvicePoint::Command,
+                source,
+                outcome: outcome.into(),
+                confidence: Some(0.9),
+                latency_ms: 10,
+                fallback_reason: None,
+            })
+        };
+        m.record(&advice(AdviceSource::Laya, "block"));
+        m.record(&advice(AdviceSource::Native, "allow"));
+        let t = m.snapshot().advisor.points[&AdvicePoint::Command].clone();
+        assert_eq!((t.laya, t.native, t.escalations, t.latency_ms_sum), (1, 1, 1, 20));
+    }
+
+    #[test]
+    fn real_savings_only_from_measured_stages() {
+        let m = Metrics::default();
+        assert_eq!(m.snapshot().total_saved_real(), None);
+        m.record(&AppEvent::MeasuredSaving { stage: Stage::Headroom, tokens_before: 1000, tokens_after: 600 });
+        assert_eq!(m.snapshot().total_saved_real(), Some(400));
     }
 
     #[test]

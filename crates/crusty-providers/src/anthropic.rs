@@ -1,17 +1,23 @@
 //! Anthropic Messages API (and Anthropic-compatible proxies).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use crusty_core::config::ProviderConfig;
 use crusty_core::message::{ChatRequest, ChatResponse, ContentBlock, StopReason, StreamDelta, Usage};
 use crusty_core::provider::{CallOptions, DeltaSink, Provider, ProviderError, ProviderKind};
 use reqwest::RequestBuilder;
+use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
 
-use crate::common::{ensure_success, env_value, for_each_sse, map_reqwest, parse_tool_input, resolve_base, truncated_stream};
+use crate::bedrock;
+use crate::common::{
+    EnvFn, ensure_success, for_each_sse, map_reqwest, non_blank, parse_tool_input, process_env, resolve_base, truncated_stream,
+};
 use crate::retry::with_retries;
 use crate::sse::SseEvent;
+use crate::vertex::{self, TokenSource, VERTEX_VERSION};
 
 const DEFAULT_RETRIES: u32 = 3;
 /// From this `anthropic-version` on, the API rejects sampling parameters.
@@ -28,7 +34,30 @@ const API_HOST: &str = "api.anthropic.com";
 enum Credential {
     ApiKey(String),
     Bearer(String),
+    /// Ready-made headers: Bedrock bearer or SigV4, Vertex OAuth.
+    Headers(Vec<(String, String)>),
     None,
+}
+
+/// Where a Messages call goes and how it authenticates. Request bodies and stream handling
+/// are shared by every endpoint.
+pub(crate) enum Endpoint {
+    /// `api.anthropic.com` or an Anthropic-compatible proxy: API key or bearer.
+    FirstParty,
+    /// Bedrock Mantle: bearer key or SigV4.
+    Bedrock,
+    /// Vertex `streamRawPredict`: OAuth bearer from the token source.
+    Vertex(Arc<dyn TokenSource>),
+}
+
+impl Endpoint {
+    fn kind(&self) -> ProviderKind {
+        match self {
+            Endpoint::FirstParty => ProviderKind::Anthropic,
+            Endpoint::Bedrock => ProviderKind::Bedrock,
+            Endpoint::Vertex(_) => ProviderKind::Vertex,
+        }
+    }
 }
 
 /// Anthropic Messages provider.
@@ -37,11 +66,18 @@ pub struct AnthropicProvider {
     cfg: ProviderConfig,
     http: reqwest::Client,
     api_key: Option<String>,
+    endpoint: Endpoint,
+    env: EnvFn,
 }
 
 impl AnthropicProvider {
     pub fn new(id: impl Into<String>, cfg: ProviderConfig, http: reqwest::Client) -> Self {
-        AnthropicProvider { id: id.into(), cfg, http, api_key: None }
+        Self::with_endpoint(id, cfg, http, Endpoint::FirstParty, process_env())
+    }
+
+    /// Provider on `endpoint` that reads configuration values through `env`.
+    pub(crate) fn with_endpoint(id: impl Into<String>, cfg: ProviderConfig, http: reqwest::Client, endpoint: Endpoint, env: EnvFn) -> Self {
+        AnthropicProvider { id: id.into(), cfg, http, api_key: None, endpoint, env }
     }
 
     /// Uses `key` instead of the environment variable (tests and explicit overrides).
@@ -50,14 +86,31 @@ impl AnthropicProvider {
         self
     }
 
-    fn credential(&self, base: &str) -> Result<Credential, ProviderError> {
+    /// Credentials of one call, for the endpoint it goes to. `method`, `url` and `body` are
+    /// what SigV4 signs.
+    async fn credential(&self, base: &str, method: &str, url: &str, body: &[u8]) -> Result<Credential, ProviderError> {
+        match &self.endpoint {
+            Endpoint::FirstParty => self.first_party_credential(base),
+            Endpoint::Bedrock => Ok(Credential::Headers(bedrock::auth_headers(&self.cfg, &*self.env, method, url, body)?)),
+            Endpoint::Vertex(tokens) => {
+                let token = tokens.access_token().await?;
+                Ok(Credential::Headers(vec![("authorization".to_owned(), format!("Bearer {token}"))]))
+            }
+        }
+    }
+
+    fn env_var(&self, name: Option<&str>) -> Option<String> {
+        name.and_then(|n| non_blank((self.env)(n)))
+    }
+
+    fn first_party_credential(&self, base: &str) -> Result<Credential, ProviderError> {
         if let Some(key) = self.api_key.clone() {
             return Ok(Credential::ApiKey(key));
         }
-        if let Some(key) = env_value(self.cfg.api_key_env.as_deref()) {
+        if let Some(key) = self.env_var(self.cfg.api_key_env.as_deref()) {
             return Ok(Credential::ApiKey(key));
         }
-        if let Some(token) = env_value(self.cfg.auth_token_env.as_deref()) {
+        if let Some(token) = self.env_var(self.cfg.auth_token_env.as_deref()) {
             return Ok(Credential::Bearer(token));
         }
         if is_anthropic_host(base) {
@@ -72,12 +125,20 @@ impl AnthropicProvider {
 
     /// Adds version, credential, configured headers and the merged `anthropic-beta` header.
     fn decorate(&self, mut rb: RequestBuilder, cred: &Credential, mut betas: Vec<String>, extra: &[(String, String)]) -> RequestBuilder {
-        rb = rb.header("anthropic-version", self.cfg.anthropic_version.as_str());
+        // Vertex carries the version in the body only.
+        if !matches!(self.endpoint, Endpoint::Vertex(_)) {
+            rb = rb.header("anthropic-version", self.cfg.anthropic_version.as_str());
+        }
         match cred {
             Credential::ApiKey(key) => rb = rb.header("x-api-key", key.as_str()),
             Credential::Bearer(token) => {
                 rb = rb.bearer_auth(token);
                 betas.push(OAUTH_BETA.to_owned());
+            }
+            Credential::Headers(headers) => {
+                for (name, value) in headers {
+                    rb = rb.header(name.as_str(), value.as_str());
+                }
             }
             Credential::None => {}
         }
@@ -97,14 +158,74 @@ impl AnthropicProvider {
         rb
     }
 
+    /// Base URL of a call for this endpoint.
+    fn base(&self, opts: &CallOptions) -> Result<String, ProviderError> {
+        match &self.endpoint {
+            Endpoint::FirstParty => resolve_base(opts, &self.cfg),
+            Endpoint::Bedrock => bedrock::base_url(opts, &self.cfg, &*self.env),
+            Endpoint::Vertex(_) => vertex::base_url(opts, &self.cfg, &*self.env),
+        }
+    }
+
+    /// URL of a Messages call. Bedrock and first-party share `{base}/v1/messages`.
+    fn messages_url(&self, base: &str, model: &str) -> Result<String, ProviderError> {
+        match &self.endpoint {
+            Endpoint::Vertex(_) => vertex::messages_url(base, &self.cfg, &*self.env, model),
+            _ => Ok(endpoint(base, "/messages")),
+        }
+    }
+
+    /// URL of the token-counting call.
+    fn count_url(&self, base: &str) -> Result<String, ProviderError> {
+        match &self.endpoint {
+            Endpoint::Vertex(_) => vertex::count_url(base, &self.cfg, &*self.env),
+            _ => Ok(endpoint(base, "/messages/count_tokens")),
+        }
+    }
+
+    /// Applies the endpoint's body rewrites: the Bedrock model id, or Vertex's version and
+    /// (for Messages calls, `drop_model`) the model that moves into the URL.
+    pub(crate) fn shape_body(&self, body: &mut Value, model: &str, drop_model: bool) {
+        match &self.endpoint {
+            Endpoint::FirstParty => {}
+            Endpoint::Bedrock => body["model"] = json!(bedrock::model_id(model)),
+            Endpoint::Vertex(_) => {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.entry("anthropic_version").or_insert_with(|| json!(VERTEX_VERSION));
+                    if drop_model {
+                        obj.remove("model");
+                    }
+                }
+            }
+        }
+    }
+
+    /// POSTs a JSON body with this endpoint's credentials. The status is left to the caller.
+    async fn post_json(
+        &self,
+        base: &str,
+        url: &str,
+        body: &Value,
+        betas: Vec<String>,
+        extra: &[(String, String)],
+    ) -> Result<reqwest::Response, ProviderError> {
+        let bytes = serde_json::to_vec(body).map_err(|e| ProviderError::Parse(e.to_string()))?;
+        let cred = self.credential(base, "POST", url, &bytes).await?;
+        let rb = self.http.post(url).header(CONTENT_TYPE, "application/json").body(bytes);
+        self.decorate(rb, &cred, betas, extra).send().await.map_err(map_reqwest)
+    }
+
     async fn send_messages(&self, req: &ChatRequest, opts: &CallOptions) -> Result<reqwest::Response, ProviderError> {
-        let base = resolve_base(opts, &self.cfg)?;
-        let cred = self.credential(&base)?;
-        let eager_default = opts.base_url_override.is_none() && self.cfg.via_proxy.is_none();
-        let (body, betas) = build_body(req, &self.cfg, eager_default);
-        let url = endpoint(&base, "/messages");
-        let rb = self.http.post(url).json(&body);
-        let resp = self.decorate(rb, &cred, betas, &opts.extra_headers).send().await.map_err(map_reqwest)?;
+        let base = self.base(opts)?;
+        let first_party = matches!(self.endpoint, Endpoint::FirstParty);
+        let mut cfg = self.cfg.clone();
+        // Server-side fallbacks and eager tool streaming are first-party features.
+        cfg.server_fallbacks &= first_party;
+        let eager_default = first_party && opts.base_url_override.is_none() && self.cfg.via_proxy.is_none();
+        let (mut body, betas) = build_body(req, &cfg, eager_default);
+        self.shape_body(&mut body, &req.model, true);
+        let url = self.messages_url(&base, &req.model)?;
+        let resp = self.post_json(&base, &url, &body, betas, &opts.extra_headers).await?;
         ensure_success(resp).await
     }
 
@@ -120,7 +241,7 @@ impl Provider for AnthropicProvider {
     }
 
     fn kind(&self) -> ProviderKind {
-        ProviderKind::Anthropic
+        self.endpoint.kind()
     }
 
     async fn stream(&self, req: &ChatRequest, opts: &CallOptions, on_delta: DeltaSink<'_>) -> Result<ChatResponse, ProviderError> {
@@ -134,9 +255,7 @@ impl Provider for AnthropicProvider {
     }
 
     async fn count_tokens(&self, req: &ChatRequest) -> Option<u64> {
-        let opts = CallOptions::default();
-        let base = resolve_base(&opts, &self.cfg).ok()?;
-        let cred = self.credential(&base).ok()?;
+        let base = self.base(&CallOptions::default()).ok()?;
         let value = serde_json::to_value(req).ok()?;
         let mut body = json!({ "model": req.model, "messages": value["messages"] });
         if !req.system.is_empty() {
@@ -145,18 +264,23 @@ impl Provider for AnthropicProvider {
         if !req.tools.is_empty() {
             body["tools"] = value["tools"].clone();
         }
-        let url = endpoint(&base, "/messages/count_tokens");
-        let resp = self.decorate(self.http.post(url).json(&body), &cred, Vec::new(), &[]).send().await.ok()?;
+        self.shape_body(&mut body, &req.model, false);
+        let url = self.count_url(&base).ok()?;
+        let resp = self.post_json(&base, &url, &body, Vec::new(), &[]).await.ok()?;
         let resp = ensure_success(resp).await.ok()?;
         let v: Value = resp.json().await.ok()?;
         v["input_tokens"].as_u64()
     }
 
     async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
-        let opts = CallOptions::default();
-        let base = resolve_base(&opts, &self.cfg)?;
-        let cred = self.credential(&base)?;
-        let resp = self.decorate(self.http.get(endpoint(&base, "/models")), &cred, Vec::new(), &[]).send().await.map_err(map_reqwest)?;
+        // Only the first-party API has a model list in this crate.
+        if !matches!(self.endpoint, Endpoint::FirstParty) {
+            return Ok(Vec::new());
+        }
+        let base = self.base(&CallOptions::default())?;
+        let url = endpoint(&base, "/models");
+        let cred = self.credential(&base, "GET", &url, &[]).await?;
+        let resp = self.decorate(self.http.get(&url), &cred, Vec::new(), &[]).send().await.map_err(map_reqwest)?;
         let resp = ensure_success(resp).await?;
         let v: Value = resp.json().await.map_err(|e| ProviderError::Parse(e.to_string()))?;
         Ok(v["data"].as_array().map(|items| items.iter().filter_map(|m| m["id"].as_str().map(str::to_owned)).collect()).unwrap_or_default())

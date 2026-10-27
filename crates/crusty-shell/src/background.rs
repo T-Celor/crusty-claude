@@ -18,6 +18,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
 use crate::bash::BashTool;
+use crate::sandbox::{Keep, Launch, Protected, SandboxSetup, settle};
 
 /// Newest output kept per background shell, in bytes.
 const OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -105,8 +106,10 @@ pub struct BackgroundShells {
 impl BackgroundShells {
     /// Starts `command` in the background and returns its id (`bash_<n>`). Its stdout and
     /// stderr are read continuously into a bounded buffer until it exits or is killed; it is
-    /// killed after `max_secs` seconds. Fails when `MAX_RUNNING` shells are already running.
-    pub fn spawn(&self, mut command: Command, max_secs: u64) -> Result<String, ToolError> {
+    /// killed after `max_secs` seconds. `launch` confines the child once spawned, and
+    /// `protected` (from [`Launch::protect`]) is restored when it ends. Fails when
+    /// `MAX_RUNNING` shells are already running.
+    pub fn spawn(&self, mut command: Command, max_secs: u64, launch: &Launch, protected: Option<Protected>) -> Result<String, ToolError> {
         let mut shells = lock(&self.shells);
         if shells.values().filter(|s| s.status() == ShellStatus::Running).count() >= MAX_RUNNING {
             return Err(ToolError::InvalidInput(format!(
@@ -114,6 +117,7 @@ impl BackgroundShells {
             )));
         }
         let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).kill_on_drop(true).spawn()?;
+        let keep = launch.adopt(&child)?;
         let id = format!("bash_{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
         let (done, _) = watch::channel(false);
         let shell = Arc::new(Shell {
@@ -128,7 +132,7 @@ impl BackgroundShells {
         if let Some(err) = child.stderr.take() {
             tokio::spawn(pump(err, shell.clone()));
         }
-        tokio::spawn(supervise(child, shell.clone()));
+        tokio::spawn(supervise(child, shell.clone(), keep, protected));
         let mut done = shell.done.subscribe();
         let killer = shell.clone();
         tokio::spawn(async move {
@@ -156,7 +160,9 @@ async fn pump<R: AsyncRead + Unpin>(mut reader: R, shell: Arc<Shell>) {
     }
 }
 
-async fn supervise(mut child: Child, shell: Arc<Shell>) {
+/// Waits for the child and records its status. `_keep` lives until the child is gone, then
+/// protected files are restored and the fact is appended to the output.
+async fn supervise(mut child: Child, shell: Arc<Shell>, _keep: Keep, protected: Option<Protected>) {
     let status = tokio::select! {
         result = child.wait() => ShellStatus::Exited(result.ok().and_then(|s| s.code())),
         _ = shell.cancel.cancelled() => {
@@ -165,6 +171,9 @@ async fn supervise(mut child: Child, shell: Arc<Shell>) {
             ShellStatus::Killed
         }
     };
+    if let Some(settled) = settle(protected) {
+        shell.append(format!("\n{}\n", settled.message).as_bytes());
+    }
     *lock(&shell.status) = status;
     shell.done.send_replace(true);
 }
@@ -288,7 +297,12 @@ impl Tool for KillShellTool {
     }
 }
 
-/// The Bash, BashOutput and KillShell tools, sharing one registry of background shells.
-pub fn shell_tools(shells: Arc<BackgroundShells>) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(BashTool::new(shells.clone())), Arc::new(BashOutputTool { shells: shells.clone() }), Arc::new(KillShellTool { shells })]
+/// The Bash, BashOutput and KillShell tools, sharing one registry of background shells. Bash
+/// commands are confined by `sandbox` when it is given.
+pub fn shell_tools(shells: Arc<BackgroundShells>, sandbox: Option<Arc<SandboxSetup>>) -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(BashTool::new(shells.clone(), sandbox)),
+        Arc::new(BashOutputTool { shells: shells.clone() }),
+        Arc::new(KillShellTool { shells }),
+    ]
 }

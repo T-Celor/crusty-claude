@@ -11,13 +11,15 @@ repository.workspace = true
 crusty-core = { workspace = true }
 crusty-optimizer = { workspace = true }
 crusty-gate = { workspace = true }
+crusty-dlp = { workspace = true }
+crusty-advisor = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

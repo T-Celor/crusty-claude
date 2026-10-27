@@ -155,9 +155,22 @@ impl Default for OrchestratorConfig {
             max_parallel_agents: 3,
             max_review_loops: 2,
             max_depth: 1,
-            direct_tools: ["Read", "Glob", "Grep", "LS", "Graph", "Retrieve", "WebSearch", "WebFetch", "TodoWrite", "Task"]
-                .map(String::from)
-                .to_vec(),
+            direct_tools: [
+                "Read",
+                "Glob",
+                "Grep",
+                "LS",
+                "Graph",
+                "Retrieve",
+                "WebSearch",
+                "WebFetch",
+                "TodoWrite",
+                "Skill",
+                "ToolSearch",
+                "Task",
+            ]
+            .map(String::from)
+            .to_vec(),
         }
     }
 }
@@ -207,6 +220,13 @@ pub struct ProviderConfig {
     pub via_proxy: Option<String>,
     pub timeout_secs: Option<u64>,
     pub max_retries: Option<u32>,
+    /// Bedrock and Vertex region. Bedrock falls back to `AWS_REGION` / `AWS_DEFAULT_REGION`,
+    /// Vertex to `CLOUD_ML_REGION`, then `global`.
+    pub region: Option<String>,
+    /// Vertex project. Falls back to `ANTHROPIC_VERTEX_PROJECT_ID`, then `GOOGLE_CLOUD_PROJECT`.
+    pub project_id: Option<String>,
+    /// Bedrock: named profile of `~/.aws/credentials` (falls back to `AWS_PROFILE`, then `default`).
+    pub aws_profile: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -223,6 +243,9 @@ impl Default for ProviderConfig {
             via_proxy: None,
             timeout_secs: None,
             max_retries: None,
+            region: None,
+            project_id: None,
+            aws_profile: None,
         }
     }
 }
@@ -716,6 +739,9 @@ impl Default for HookMatcher {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct McpServerConfig {
+    /// `stdio` | `http` (streamable HTTP) | `sse` (legacy HTTP+SSE). Inferred when absent:
+    /// `command` means stdio, `url` means http.
+    pub transport: Option<String>,
     /// stdio transport.
     pub command: Option<String>,
     pub args: Vec<String>,
@@ -760,6 +786,347 @@ impl Default for SessionConfig {
     }
 }
 
+/// How commands run by the agent (`Bash`, background shells) are confined by the OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    /// Unconfined (the risk scanner and permission rules still apply).
+    Off,
+    /// Read what the user can read; write only the workspace, `writable_roots` and a
+    /// private temporary directory.
+    #[default]
+    WorkspaceWrite,
+    /// Write nothing but a private temporary directory.
+    ReadOnly,
+}
+
+impl std::fmt::Display for SandboxMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SandboxMode::Off => "off",
+            SandboxMode::WorkspaceWrite => "workspace-write",
+            SandboxMode::ReadOnly => "read-only",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxConfig {
+    pub mode: SandboxMode,
+    /// Network access for sandboxed commands. Blocking it needs Landlock ABI v4 or
+    /// bubblewrap on Linux, Seatbelt on macOS; Windows cannot block it without admin
+    /// rights and reports so.
+    pub network: bool,
+    /// Extra writable directories (a shared build cache, for example).
+    pub writable_roots: Vec<PathBuf>,
+    /// Refuse to run a command when no sandbox backend works here, instead of running it
+    /// unconfined with a warning.
+    pub fail_if_unavailable: bool,
+    /// Let the model ask to run one command outside the sandbox (`sandbox: false`). Such a
+    /// call is always asked, whatever the mode and rules.
+    pub allow_unsandboxed_requests: bool,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        SandboxConfig {
+            mode: SandboxMode::WorkspaceWrite,
+            network: true,
+            writable_roots: Vec::new(),
+            fail_if_unavailable: false,
+            allow_unsandboxed_requests: true,
+        }
+    }
+}
+
+/// Laya command and file guard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayaGuardConfig {
+    /// Judge shell commands before they run (escalates only: allow → ask → deny).
+    pub commands: bool,
+    /// Judge writes to `sensitive_paths`.
+    pub files: bool,
+    /// Globs whose changes are always asked and judged: secrets, ignore rules, CI/CD,
+    /// container and build definitions.
+    pub sensitive_paths: Vec<String>,
+}
+
+impl Default for LayaGuardConfig {
+    fn default() -> Self {
+        LayaGuardConfig {
+            commands: true,
+            files: true,
+            sensitive_paths: [
+                "**/.env",
+                "**/.env.*",
+                "**/.gitignore",
+                "**/.gitattributes",
+                "**/.dockerignore",
+                "**/.github/workflows/**",
+                "**/.github/actions/**",
+                "**/.gitlab-ci.yml",
+                "**/.circleci/**",
+                "**/azure-pipelines.yml",
+                "**/Jenkinsfile",
+                "**/Dockerfile",
+                "**/Dockerfile.*",
+                "**/docker-compose*.yml",
+                "**/compose*.yaml",
+                "**/.npmrc",
+                "**/.pypirc",
+                "**/CODEOWNERS",
+            ]
+            .map(String::from)
+            .to_vec(),
+        }
+    }
+}
+
+/// Outbound data-loss prevention: secrets and personal data are masked before a request
+/// leaves the machine, and restored locally in tool inputs and in what the user sees.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DlpConfig {
+    pub enabled: bool,
+    pub secrets: bool,
+    /// E-mail addresses, phone numbers, payment cards (Luhn), IBANs (checksum).
+    pub pii: bool,
+    /// Ambiguous high-entropy strings are masked when Laya (or the native scorer) puts
+    /// the probability of a secret at or above this.
+    pub ambiguous_threshold: f64,
+    /// Restore masked values in tool inputs before a tool runs.
+    pub rehydrate: bool,
+    /// Literal values never masked (public e-mail of the project, test card numbers...).
+    pub allow_values: Vec<String>,
+}
+
+impl Default for DlpConfig {
+    fn default() -> Self {
+        DlpConfig { enabled: true, secrets: true, pii: true, ambiguous_threshold: 0.5, rehydrate: true, allow_values: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RerankConfig {
+    pub enabled: bool,
+    /// Rerank only when a search returns more fragments than this.
+    pub min_items: usize,
+    /// Fragments kept after reranking (the rest stay retrievable).
+    pub keep: usize,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        RerankConfig { enabled: true, min_items: 30, keep: 20 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrunerConfig {
+    pub enabled: bool,
+    /// The most recent messages are never pruned.
+    pub keep_recent_messages: usize,
+    /// Older tool results below this relevance to the current goal are replaced by a
+    /// retrievable stub.
+    pub min_relevance: f64,
+    /// Pruning decisions advance by this many messages at a time, so the prompt prefix
+    /// stays stable for the provider cache between advances.
+    pub batch_messages: usize,
+}
+
+impl Default for PrunerConfig {
+    fn default() -> Self {
+        PrunerConfig { enabled: true, keep_recent_messages: 12, min_relevance: 0.15, batch_messages: 8 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TriageConfig {
+    pub enabled: bool,
+    /// Triage the output of a failed command longer than this many lines.
+    pub min_lines: usize,
+    /// Error blocks kept, best first.
+    pub max_blocks: usize,
+    /// Lines of context kept around each error line.
+    pub context_lines: usize,
+}
+
+impl Default for TriageConfig {
+    fn default() -> Self {
+        TriageConfig { enabled: true, min_lines: 60, max_blocks: 8, context_lines: 3 }
+    }
+}
+
+/// Picks the orchestrator model from the complexity of the conversation's first prompt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RouterConfig {
+    pub enabled: bool,
+    /// Route every prompt instead of the first one only (switching models drops the
+    /// provider prompt cache).
+    pub every_prompt: bool,
+    /// Below this confidence the configured orchestrator model is kept.
+    pub min_confidence: f64,
+    /// `trivial` | `routine` | `hard` | `research` → model settings.
+    pub tiers: BTreeMap<String, ModelOverride>,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        let tier = |model: &str, effort: &str| ModelOverride {
+            provider: Some("anthropic".into()),
+            model: Some(model.into()),
+            effort: Some(effort.into()),
+            ..ModelOverride::default()
+        };
+        RouterConfig {
+            enabled: true,
+            every_prompt: false,
+            min_confidence: 0.475,
+            tiers: BTreeMap::from([
+                ("trivial".to_string(), tier("claude-haiku-5-5", "low")),
+                ("routine".to_string(), tier("claude-sonnet-5-5", "medium")),
+                ("hard".to_string(), tier("claude-opus-5-5", "high")),
+                ("research".to_string(), tier("claude-opus-5-5", "xhigh")),
+            ]),
+        }
+    }
+}
+
+/// Intent detection: MCP servers that do not look relevant to the prompt are deferred
+/// behind the `ToolSearch` tool instead of being sent with every request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IntentConfig {
+    pub enabled: bool,
+    pub defer_mcp_tools: bool,
+    /// Servers below this relevance are deferred.
+    pub min_relevance: f64,
+    /// MCP servers never deferred.
+    pub always_load: Vec<String>,
+}
+
+impl Default for IntentConfig {
+    fn default() -> Self {
+        IntentConfig { enabled: true, defer_mcp_tools: true, min_relevance: 0.3, always_load: Vec::new() }
+    }
+}
+
+/// The `auto` permission mode: a request that would be asked runs without asking when
+/// the advisor is confident it is safe. Only low and moderate risk can run unasked; high
+/// and critical risk, and requests escalated by the guard, are always asked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoModeConfig {
+    /// Confidence needed to auto-approve a low or moderate risk request.
+    pub threshold: f64,
+}
+
+impl Default for AutoModeConfig {
+    fn default() -> Self {
+        AutoModeConfig { threshold: 0.8 }
+    }
+}
+
+/// Laya, a local System 1 decision model served by `laya-serve`. Every integration point
+/// has a native fallback, used when Laya is disabled, unreachable or unsure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayaConfig {
+    /// Use `laya-serve` when it answers. Off: native heuristics only.
+    pub enabled: bool,
+    pub url: String,
+    /// Environment variable holding the bearer token of `laya-serve` (`LAYA_API_KEY`).
+    pub api_key_env: Option<String>,
+    pub timeout_ms: u64,
+    pub health_interval_secs: u64,
+    /// Answers below this confidence are treated as unsure: the native fallback decides.
+    pub min_confidence: f64,
+    pub guard: LayaGuardConfig,
+    pub dlp: DlpConfig,
+    pub rerank: RerankConfig,
+    pub pruner: PrunerConfig,
+    pub triage: TriageConfig,
+    pub router: RouterConfig,
+    pub intent: IntentConfig,
+    pub auto_mode: AutoModeConfig,
+}
+
+impl Default for LayaConfig {
+    fn default() -> Self {
+        LayaConfig {
+            enabled: true,
+            url: "http://127.0.0.1:8000".into(),
+            api_key_env: Some("LAYA_API_KEY".into()),
+            timeout_ms: 1500,
+            health_interval_secs: 30,
+            min_confidence: 0.6,
+            guard: LayaGuardConfig::default(),
+            dlp: DlpConfig::default(),
+            rerank: RerankConfig::default(),
+            pruner: PrunerConfig::default(),
+            triage: TriageConfig::default(),
+            router: RouterConfig::default(),
+            intent: IntentConfig::default(),
+            auto_mode: AutoModeConfig::default(),
+        }
+    }
+}
+
+/// File snapshots taken before the agent changes a file, for `/rewind`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheckpointConfig {
+    pub enabled: bool,
+    /// Larger files are not snapshotted (the rewind reports them).
+    pub max_file_bytes: u64,
+    /// Checkpoint directories of older sessions are removed beyond this count per project.
+    pub keep_sessions: usize,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        CheckpointConfig { enabled: true, max_file_bytes: 5 * 1024 * 1024, keep_sessions: 20 }
+    }
+}
+
+/// Skills: `SKILL.md` folders in `.crusty/skills`, `.claude/skills` (project and home)
+/// and in plugins, offered to the model through the `Skill` tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    pub enabled: bool,
+    /// Skill names never offered.
+    pub disabled: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        SkillsConfig { enabled: true, disabled: Vec::new() }
+    }
+}
+
+/// Plugins: folders with `.claude-plugin/plugin.json` (or `.crusty-plugin/plugin.json`)
+/// bringing commands, agents, skills, hooks and MCP servers. Installed under
+/// `~/.crusty/plugins`; project plugins (`.crusty/plugins`) load only in trusted projects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginsConfig {
+    pub enabled: bool,
+    pub disabled: Vec<String>,
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        PluginsConfig { enabled: true, disabled: Vec::new() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -780,6 +1147,11 @@ pub struct Config {
     pub hooks: BTreeMap<String, Vec<HookMatcher>>,
     pub mcp: McpConfig,
     pub session: SessionConfig,
+    pub sandbox: SandboxConfig,
+    pub laya: LayaConfig,
+    pub checkpoints: CheckpointConfig,
+    pub skills: SkillsConfig,
+    pub plugins: PluginsConfig,
 }
 
 fn domain(description: &str, model: &str, effort: &str, tools: Option<&[&str]>) -> DomainConfig {
@@ -843,6 +1215,9 @@ impl Default for Config {
             ),
             ("ollama".to_string(), provider(ProviderKind::Openai, "http://127.0.0.1:11434/v1", None)),
             ("mock".to_string(), provider(ProviderKind::Mock, "", None)),
+            // Base URLs of Bedrock and Vertex are derived from the region when left empty.
+            ("bedrock".to_string(), provider(ProviderKind::Bedrock, "", Some("AWS_BEARER_TOKEN_BEDROCK"))),
+            ("vertex".to_string(), provider(ProviderKind::Vertex, "", None)),
         ]);
         // Anthropic first-party list prices (USD / MTok), 5-minute cache writes at 1.25x input.
         let pricing_table = BTreeMap::from([
@@ -882,7 +1257,7 @@ impl Default for Config {
                 mode: OptimizerMode::Active,
                 preserve_original: true,
                 minimum_estimated_gain: 0.05,
-                measure_with_count_tokens: false,
+                measure_with_count_tokens: true,
                 ..OptimizerConfig::default()
             },
             proxy: ProxyConfig::default(),
@@ -890,6 +1265,11 @@ impl Default for Config {
             hooks: BTreeMap::new(),
             mcp: McpConfig::default(),
             session: SessionConfig::default(),
+            sandbox: SandboxConfig::default(),
+            laya: LayaConfig::default(),
+            checkpoints: CheckpointConfig::default(),
+            skills: SkillsConfig::default(),
+            plugins: PluginsConfig::default(),
         }
     }
 }
@@ -990,6 +1370,11 @@ const PROJECT_RESTRICTED: &[&str] = &[
     "optimizer.pxpipe.mode",
     "optimizer.pxpipe.external_url",
     "session.dir",
+    // A project must not weaken confinement, point the advisor (which sees prompts and
+    // commands) at another host, or load code through plugins.
+    "sandbox",
+    "laya",
+    "plugins",
 ];
 
 /// Removes the restricted settings from an untrusted layer; returns those it removed.
@@ -1178,7 +1563,9 @@ impl Config {
             return invalid("orchestrator.max_steps and max_parallel_agents must be positive".into());
         }
         for (name, p) in &self.providers {
-            if p.kind != ProviderKind::Mock && url::Url::parse(&p.base_url).is_err() {
+            // Bedrock and Vertex derive their endpoint from the region when it is empty.
+            let derived = matches!(p.kind, ProviderKind::Bedrock | ProviderKind::Vertex) && p.base_url.is_empty();
+            if p.kind != ProviderKind::Mock && !derived && url::Url::parse(&p.base_url).is_err() {
                 return invalid(format!("providers.{name}.base_url is not a valid URL: `{}`", p.base_url));
             }
             if let Some(proxy) = &p.via_proxy
@@ -1231,7 +1618,85 @@ impl Config {
         if self.permissions.mode == PermissionMode::BypassPermissions {
             warnings.push("permission mode bypassPermissions: critical actions are still asked, deny rules still apply".into());
         }
+        for (key, server) in &self.mcp.servers {
+            // Tool names are mcp__<server>__<tool>: a separator inside a server name is ambiguous.
+            if key.is_empty() || key.contains("__") {
+                return invalid(format!("mcp.servers name `{key}` must be non-empty and must not contain `__`"));
+            }
+            if let Some(t) = &server.transport
+                && !["stdio", "http", "sse"].contains(&t.as_str())
+            {
+                return invalid(format!("mcp.servers.{key}.transport must be stdio|http|sse, got `{t}`"));
+            }
+        }
+        let laya = &self.laya;
+        let laya_url = url::Url::parse(&laya.url);
+        if laya_url.is_err() {
+            return invalid(format!("laya.url is not a valid URL: `{}`", laya.url));
+        }
+        // Plain http is only allowed to a loopback host; anything remote must be https.
+        if let Ok(u) = &laya_url {
+            let loopback = match u.host() {
+                Some(url::Host::Ipv4(a)) => a.is_loopback(),
+                Some(url::Host::Ipv6(a)) => a.is_loopback(),
+                Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+                None => false,
+            };
+            if u.scheme() != "https" && !(u.scheme() == "http" && loopback) {
+                return invalid(format!("laya.url must use https (http only for localhost or loopback), got `{}`", laya.url));
+            }
+        }
+        let shares = [
+            ("laya.min_confidence", laya.min_confidence),
+            ("laya.dlp.ambiguous_threshold", laya.dlp.ambiguous_threshold),
+            ("laya.pruner.min_relevance", laya.pruner.min_relevance),
+            ("laya.router.min_confidence", laya.router.min_confidence),
+            ("laya.intent.min_relevance", laya.intent.min_relevance),
+            ("laya.auto_mode.threshold", laya.auto_mode.threshold),
+        ];
+        for (key, v) in shares {
+            if !(0.0..=1.0).contains(&v) {
+                return invalid(format!("{key} is a probability (0..1), got {v}"));
+            }
+        }
+        if laya.timeout_ms == 0 || laya.rerank.keep == 0 || laya.triage.max_blocks == 0 || laya.pruner.batch_messages == 0 {
+            return invalid("laya: timeout_ms, rerank.keep, triage.max_blocks and pruner.batch_messages must be positive".into());
+        }
+        for (tier, o) in &laya.router.tiers {
+            if !["trivial", "routine", "hard", "research"].contains(&tier.as_str()) {
+                return invalid(format!("laya.router.tiers: unknown tier `{tier}` (trivial|routine|hard|research)"));
+            }
+            check_profile(&format!("laya.router.tiers.{tier}"), &self.executor.apply(o))?;
+        }
+        if self.sandbox.mode == SandboxMode::Off {
+            warnings.push("sandbox.mode = off: commands run unconfined".into());
+        }
         Ok(warnings)
+    }
+
+    /// The model name as priced and described in the tables: provider prefixes and
+    /// version suffixes of Bedrock (`us.anthropic.claude-opus-5-5-v1:0`) and Vertex
+    /// (`claude-opus-5-5@20261101`) are removed.
+    pub fn base_model_name(model: &str) -> &str {
+        let mut m = model;
+        for region in ["us.", "eu.", "apac.", "global.", "jp.", "au.", "ca.", "us-gov."] {
+            if let Some(rest) = m.strip_prefix(region)
+                && rest.starts_with("anthropic.")
+            {
+                m = rest;
+                break;
+            }
+        }
+        m = m.strip_prefix("anthropic.").unwrap_or(m);
+        if let Some((base, _)) = m.split_once('@') {
+            m = base;
+        }
+        if let Some(pos) = m.rfind("-v")
+            && m[pos + 2..].split(':').next().is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()))
+        {
+            m = &m[..pos];
+        }
+        m
     }
 
     /// Enabled domain names.
@@ -1254,11 +1719,11 @@ impl Config {
     }
 
     pub fn pricing_for(&self, model: &str) -> Option<ModelPricing> {
-        self.pricing.get(model).copied()
+        self.pricing.get(model).or_else(|| self.pricing.get(Self::base_model_name(model))).copied()
     }
 
     pub fn model_info(&self, model: &str) -> ModelInfo {
-        self.models.get(model).copied().unwrap_or_default()
+        self.models.get(model).or_else(|| self.models.get(Self::base_model_name(model))).copied().unwrap_or_default()
     }
 
     /// Cost of `usage` on `model`, 0 when the model has no price.
@@ -1411,6 +1876,32 @@ mod tests {
         let mut c = Config::default();
         c.optimizer.context_gate.policy = "always".into();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn laya_url_must_be_https_unless_loopback() {
+        let mut c = Config::default();
+        for ok in ["https://laya.example.com", "http://127.0.0.1:8000", "http://localhost:8000", "http://[::1]:8000"] {
+            c.laya.url = ok.into();
+            assert!(c.validate().is_ok(), "{ok} should be accepted");
+        }
+        for bad in ["http://laya.example.com", "http://10.0.0.5:8000", "ftp://localhost"] {
+            c.laya.url = bad.into();
+            assert!(c.validate().is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn mcp_server_names_must_be_nonempty_and_without_double_underscore() {
+        let mut c = Config::default();
+        c.mcp.servers.insert("bad__name".into(), McpServerConfig::default());
+        assert!(c.validate().is_err());
+        c.mcp.servers.clear();
+        c.mcp.servers.insert(String::new(), McpServerConfig::default());
+        assert!(c.validate().is_err());
+        c.mcp.servers.clear();
+        c.mcp.servers.insert("files".into(), McpServerConfig::default());
+        assert!(c.validate().is_ok());
     }
 
     #[test]

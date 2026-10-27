@@ -1,7 +1,10 @@
 //! Native code knowledge graph (Graphify-style): index, communities, queries.
 //!
-//! The graph is built by regex extraction over the repository, persisted under
+//! The graph is built by extracting definitions and imports from the repository, persisted under
 //! `<root>/.crusty/graph/`, and queried through [`GraphTool`] instead of reading whole files.
+//! Two extractors produce the same model: tree-sitter parses Rust, Python, JavaScript,
+//! TypeScript, Go, Java, C and C++ (feature `tree-sitter`, on by default); a regex extractor
+//! handles every other language, and all languages when the feature is off.
 //! Everything is heuristic: edges marked `Inferred` are hints, not facts.
 
 pub mod analyze;
@@ -12,6 +15,8 @@ pub mod model;
 pub mod query;
 pub mod report;
 pub mod tool;
+#[cfg(feature = "tree-sitter")]
+pub mod treesitter;
 
 use std::fmt;
 use std::fs;

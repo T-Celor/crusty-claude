@@ -4,6 +4,8 @@
 //! where noted, so the provider, tool, optimizer, UI and engine crates can evolve and be
 //! tested independently. The binary wires concrete implementations together.
 
+pub mod advisor;
+pub mod checkpoint;
 pub mod config;
 pub mod event;
 pub mod filter;
@@ -18,9 +20,12 @@ pub mod store;
 pub mod tokens;
 pub mod tool;
 pub mod trust;
+pub mod vault;
 
+pub use advisor::{AdviceSource, Advisor, Judgement, NoAdvisor, Scores, Verdict};
+pub use checkpoint::{CheckpointSummary, Checkpointer, NoCheckpoints, RewindReport, RewindScope};
 pub use config::Config;
-pub use event::{AppEvent, EventSink, Stage, StageMetrics, StageStatus, UiCommand};
+pub use event::{AdviceInfo, AdvicePoint, AppEvent, EventSink, SandboxInfo, Stage, StageMetrics, StageStatus, UiCommand};
 pub use filter::{ContentFilter, Filtered, HtmlDoc, choose_filtered};
 pub use message::{ChatRequest, ChatResponse, ContentBlock, Message, Role, StopReason, StreamDelta, ToolSpec, Usage};
 pub use optimize::{OptimizeContext, OptimizeOutcome, RequestOptimizer, Route};
@@ -29,7 +34,8 @@ pub use permission::{
 };
 pub use provider::{CallOptions, ModelRef, Provider, ProviderError, ProviderKind};
 pub use store::OriginalStore;
-pub use tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
+pub use tool::{PlannedChange, Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
+pub use vault::{RedactionKind, SecretVault};
 
 /// Re-exported so implementors use the same version.
 pub use async_trait::async_trait;

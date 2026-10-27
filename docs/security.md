@@ -41,6 +41,43 @@ Le niveau dépend des effets, pas du nom :
 - **Faible** : lectures dans le projet (`ls`, `cat`, `git status/diff/log`, `grep`…). Un chemin
   hors du projet rend la commande au moins modérée.
 
+## Sandbox OS des commandes (`crusty-sandbox`)
+
+Les commandes `Bash` s'exécutent isolées selon `[sandbox]` (`mode` : `off`, `read-only`,
+`workspace-write` ; `network`, `writable_roots`, `fail_if_unavailable`, `allow_unsandboxed_requests`).
+
+| Clé | Rôle |
+|---|---|
+| `mode` | `off`, `read-only` (écrit seulement dans un dossier temporaire privé) ou `workspace-write` (défaut : projet, `writable_roots` et dossier temporaire privé) |
+| `network` | accès réseau des commandes isolées (défaut `true`) |
+| `writable_roots` | dossiers inscriptibles supplémentaires (cache de build partagé…) |
+| `fail_if_unavailable` | refuser la commande si aucun mécanisme ne fonctionne, au lieu de l'exécuter sans isolation avec un avertissement |
+| `allow_unsandboxed_requests` | permettre au modèle de demander `dangerouslyDisableSandbox` (défaut `true`) ; la demande est **toujours** soumise à l'humain (risque critique) |
+
+| Système | Mécanisme |
+|---|---|
+| Linux | bubblewrap s'il est présent, sinon Landlock (ré-exécution de `crusty __sandbox-exec`) ; avec l'un ou l'autre, les chemins protégés (`.git/hooks`, `.claude`, `.mcp.json`, `.crusty`…) sont vérifiés et restaurés après chaque commande |
+| macOS | Seatbelt (`sandbox-exec`) |
+| Windows | Job Object via `crusty __job-exec` : tue tout l'arbre de processus. **Aucune isolation du système de fichiers ni du réseau** |
+
+`dangerouslyDisableSandbox` n'est accepté que si `allow_unsandboxed_requests = true` et est
+**toujours** demandé à l'humain (risque critique), quel que soit le mode.
+
+## Laya : garde, DLP et mode `auto`
+
+Laya (`laya-serve`) et son repli natif (`crusty-advisor`) jugent les commandes Bash et les
+écritures sensibles (`[laya.guard]` : `commands`, `files`, `sensitive_paths`), masquent les
+secrets et PII sortants (`[laya.dlp]` : placeholders `⟦SECRET_n⟧`, restaurés localement dans les
+entrées d'outils et l'affichage) et décident du mode `auto` (`[laya.auto_mode] threshold`).
+
+- Laya ne peut que **durcir** une décision (allow → ask → deny), sauf en mode `auto` pour un
+  risque au plus modéré. Délai dépassé ou incertitude : on demande.
+- MCP, `WebFetch` et `WebSearch` ne s'exécutent jamais seuls sans jugement de la garde.
+- Un secret masqué inséré dans un outil autre qu'un éditeur de fichiers local est **toujours**
+  demandé à l'humain, quel que soit le mode.
+- La garde et Laya ne voient que du texte masqué. `laya.url` doit être en https ou en http sur
+  boucle locale.
+
 ## Sandbox des outils fichiers
 
 Chemins relatifs résolus depuis le projet, normalisés, canonicalisés (liens symboliques suivis,
@@ -82,8 +119,12 @@ s'il écoute ailleurs qu'en boucle locale.
 
 ## Limites connues
 
-- Les processus petits-enfants d'une commande interrompue ne sont pas tués (pas de groupes de
-  processus sans `unsafe`) ; les shells d'arrière-plan sont plafonnés (8) et tués après
+- Sous Windows, la sandbox ne fait que tuer l'arbre de processus : ni système de fichiers ni
+  réseau isolés. Les sandbox Linux et macOS sont testées unitairement, pas contre du code hostile.
+- Le DLP ne scanne ni les images ni les blocs de réflexion (le modèle ne voit que des entrées masquées).
+- Un hook `PreToolUse` qui réécrit une entrée d'outil est jugé tel qu'écrit.
+- Laya exige un `laya-serve` séparé ; sans lui, heuristiques natives.
+- Les shells d'arrière-plan sont plafonnés (8) et tués après
   `bash_max_timeout_secs`.
 - Les hooks et serveurs MCP configurés par l'utilisateur s'exécutent avec ses droits : seuls les
   projets de confiance peuvent en définir.

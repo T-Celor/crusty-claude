@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 regex = { workspace = true }
 png = { workspace = true }
 noto-sans-mono-bitmap = { workspace = true, features = ["size_16", "regular", "unicode-basic-latin", "unicode-latin-1-supplement", "unicode-latin-extended-a", "unicode-specials"] }
+unifont = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }

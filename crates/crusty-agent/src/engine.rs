@@ -2,17 +2,19 @@
 //! it through the optimizer, call the model (with fallbacks), gate and run the tools,
 //! repeat until the model stops.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crusty_core::config::ModelProfile;
 use crusty_core::event::{AgentStatus, TodoItem, TodoStatus};
 use crusty_core::hooks::HookEvent;
 use crusty_core::tokens::estimate_request;
+use crusty_core::tool::PlannedChange;
+use crusty_core::vault::StreamRehydrator;
 use crusty_core::{
-    AppEvent, ApprovalDecision, ApprovalRequest, CallOptions, CancellationToken, ChatRequest, ChatResponse, ContentBlock, Message,
-    ModelRef, OptimizeContext, OptimizeOutcome, PermissionDecision, ProviderError, ProviderKind, Role, Route, StopReason, StreamDelta,
-    Tool, ToolContext, ToolError, ToolOutput, ToolSpec, Usage,
+    AppEvent, ApprovalDecision, ApprovalRequest, CallOptions, CancellationToken, ChatRequest, ChatResponse, ContentBlock, Judgement,
+    Message, ModelRef, OptimizeContext, OptimizeOutcome, PermissionDecision, PermissionMode, Provider, ProviderError, ProviderKind,
+    RiskLevel, Role, Route, StopReason, StreamDelta, Tool, ToolContext, ToolError, ToolOutput, ToolSpec, Usage, Verdict,
 };
 use crusty_session::transcript::Entry;
 use futures::future::{BoxFuture, join_all};
@@ -23,8 +25,12 @@ use crate::{compact, delegate, prompts};
 
 pub const ORCHESTRATOR_ID: &str = "orchestrator";
 pub const TASK_TOOL: &str = "Task";
+/// Loads deferred MCP servers; handled by the engine (it needs the runtime).
+pub const TOOL_SEARCH: &str = "ToolSearch";
 /// Key the providers put in a tool input whose JSON could not be parsed.
 const INVALID_JSON_KEY: &str = "__crusty_invalid_json";
+/// Tools that write a local file: a masked secret may go into them without asking.
+const LOCAL_EDITORS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 /// One agent: who it is, which model, which tools.
 #[derive(Debug, Clone)]
@@ -120,11 +126,15 @@ fn tool_specs(rt: &Runtime, spec: &AgentSpec, kind: ProviderKind) -> Vec<ToolSpe
     let server_search = kind == ProviderKind::Anthropic && rt.config.web.search_backend == "anthropic";
     let mut specs = Vec::new();
     for name in &spec.tools {
-        if hidden.contains(name) {
+        if hidden.contains(name) || rt.is_deferred_tool(name) {
             continue;
         }
         if name == TASK_TOOL {
             specs.push(delegate::task_spec(rt));
+        } else if name == TOOL_SEARCH {
+            if !rt.deferred_servers().is_empty() {
+                specs.push(tool_search_spec());
+            }
         } else if name == "WebSearch" && server_search {
             let mut s = ToolSpec::new("web_search", "", Value::Null);
             s.extra.insert("type".into(), json!("web_search_20260209"));
@@ -189,6 +199,59 @@ fn status(rt: &Runtime, agent_id: &str, status: AgentStatus) {
     rt.events.emit(AppEvent::AgentStatus { agent_id: agent_id.to_owned(), status });
 }
 
+fn lock_rehydrator(m: &Mutex<StreamRehydrator>) -> std::sync::MutexGuard<'_, StreamRehydrator> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Server of an MCP tool (`mcp__<server>__<tool>`).
+pub fn mcp_server(tool: &str) -> Option<&str> {
+    tool.strip_prefix("mcp__")?.split_once("__").map(|(server, _)| server).filter(|s| !s.is_empty())
+}
+
+fn tool_search_spec() -> ToolSpec {
+    ToolSpec::new(
+        TOOL_SEARCH,
+        "Load deferred MCP tools. Their servers are hidden until needed: `select:<server>` loads one server; any other query matches its words against the names and descriptions of the deferred tools and loads the servers of the matches. The loaded tools are available from your next step.",
+        json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
+    )
+}
+
+/// Loads the deferred servers `query` names (`select:<server>`) or matches, and lists the
+/// tools that are now available.
+fn tool_search(rt: &Runtime, input: &Value) -> ToolOutput {
+    let query = input.get("query").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+    if let Some(server) = query.strip_prefix("select:").map(str::trim) {
+        let names: Vec<String> = rt.tools.keys().filter(|n| mcp_server(n) == Some(server)).cloned().collect();
+        if names.is_empty() {
+            return ToolOutput::error(format!("no MCP server `{server}`"));
+        }
+        rt.load_deferred(server);
+        return ToolOutput::text(format!("Loaded MCP server `{server}`. Its tools, available from your next step:\n{}", names.join("\n")));
+    }
+    let words: Vec<String> = query.to_lowercase().split_whitespace().map(str::to_owned).collect();
+    let hits: Vec<(String, String)> = rt
+        .tools
+        .iter()
+        .filter(|(name, _)| rt.is_deferred_tool(name))
+        .filter_map(|(name, tool)| {
+            let spec = tool.spec();
+            let haystack = format!("{name} {}", spec.description).to_lowercase();
+            words.iter().any(|w| haystack.contains(w.as_str())).then(|| (name.clone(), spec.description))
+        })
+        .collect();
+    if hits.is_empty() {
+        return ToolOutput::text("no deferred tool matches");
+    }
+    let mut lines = Vec::new();
+    for (name, description) in &hits {
+        if let Some(server) = mcp_server(name) {
+            rt.load_deferred(server);
+        }
+        lines.push(format!("- {name}: {description}"));
+    }
+    ToolOutput::text(format!("Loaded the servers of these tools; they are available from your next step:\n{}", lines.join("\n")))
+}
+
 /// What answered a model call.
 struct Answer {
     resp: ChatResponse,
@@ -197,9 +260,55 @@ struct Answer {
     via_failed: bool,
 }
 
+/// One streamed call. The conversation keeps placeholders; the screen shows the real values.
+/// A fresh rehydrator per call, so a retried call does not repeat text it already showed.
+async fn stream_attempt(
+    rt: &Runtime,
+    spec: &AgentSpec,
+    provider: &dyn Provider,
+    req: &ChatRequest,
+    opts: &CallOptions,
+) -> Result<ChatResponse, ProviderError> {
+    let rehydrator = Mutex::new(StreamRehydrator::default());
+    let show_thinking = rt.config.tui.show_thinking;
+    let on_delta = |d: StreamDelta| match d {
+        StreamDelta::Text(text) => {
+            let shown = lock_rehydrator(&rehydrator).push(&rt.vault, &text);
+            if !shown.is_empty() {
+                rt.events.emit(AppEvent::TextDelta { agent_id: spec.id.clone(), text: shown });
+            }
+        }
+        StreamDelta::Thinking(text) if show_thinking => rt.events.emit(AppEvent::ThinkingDelta { agent_id: spec.id.clone(), text }),
+        _ => {}
+    };
+    let result = provider.stream(req, opts, &on_delta).await;
+    let tail = lock_rehydrator(&rehydrator).finish(&rt.vault);
+    if !tail.is_empty() {
+        rt.events.emit(AppEvent::TextDelta { agent_id: spec.id.clone(), text: tail });
+    }
+    result
+}
+
+/// A fallback model's request, built for that model and sent through the optimizer like the
+/// primary's (DLP masking included).
+async fn optimized_fallback(
+    rt: &Runtime,
+    spec: &AgentSpec,
+    messages: &[Message],
+    mref: &ModelRef,
+) -> (ChatRequest, OptimizeOutcome, OptimizeContext) {
+    let mut fallback = spec.clone();
+    fallback.profile.provider.clone_from(&mref.provider);
+    fallback.profile.model.clone_from(&mref.model);
+    let mut req = build_request(rt, &fallback, messages);
+    let octx = optimize_context(rt, &fallback, mref);
+    let outcome = rt.optimizer.optimize(&mut req, &octx).await;
+    (req, outcome, octx)
+}
+
 /// Calls the model, falling back to the profile's fallback models when one is unavailable,
 /// and to the direct route when an optimizer proxy cannot be reached. A fallback model gets
-/// a request built for it (its own thinking, tools and format), not the primary's.
+/// a request built and optimized for it (its own thinking, tools and format), not the primary's.
 async fn call_model(
     rt: &Runtime,
     spec: &AgentSpec,
@@ -211,43 +320,34 @@ async fn call_model(
 ) -> Result<Answer, ProviderError> {
     let mut candidates = vec![spec.profile.model_ref()];
     candidates.extend(spec.profile.fallback.iter().filter_map(|f| ModelRef::parse(f, &spec.profile.provider)));
-    let events = rt.events.clone();
-    let agent_id = spec.id.clone();
-    let show_thinking = rt.config.tui.show_thinking;
-    let on_delta = move |d: StreamDelta| match d {
-        StreamDelta::Text(text) => events.emit(AppEvent::TextDelta { agent_id: agent_id.clone(), text }),
-        StreamDelta::Thinking(text) if show_thinking => events.emit(AppEvent::ThinkingDelta { agent_id: agent_id.clone(), text }),
-        _ => {}
-    };
     let mut last_err = ProviderError::Config(format!("provider `{}` is not configured", spec.profile.provider));
     for (i, mref) in candidates.iter().enumerate() {
         let Some(provider) = rt.provider(&mref.provider) else {
             last_err = ProviderError::Config(format!("provider `{}` is not configured", mref.provider));
             continue;
         };
-        let req = if i == 0 {
-            req.clone()
+        let owned;
+        let (req, outcome, octx) = if i == 0 {
+            (req, outcome, octx)
         } else {
-            let mut fallback = spec.clone();
-            fallback.profile.provider.clone_from(&mref.provider);
-            fallback.profile.model.clone_from(&mref.model);
-            build_request(rt, &fallback, messages)
+            owned = optimized_fallback(rt, spec, messages, mref).await;
+            (&owned.0, &owned.1, &owned.2)
         };
         let via = match &outcome.route {
-            Route::Via { base_url, .. } if i == 0 => Some(base_url.clone()),
+            Route::Via { base_url, .. } => Some(base_url.clone()),
             _ => None,
         };
         let direct = rt.provider_route(&mref.provider);
         let opts =
             CallOptions { base_url_override: via.clone().or_else(|| direct.clone()), cancel: cancel.clone(), extra_headers: Vec::new() };
-        let mut result = provider.stream(&req, &opts, &on_delta).await;
+        let mut result = stream_attempt(rt, spec, provider.as_ref(), req, &opts).await;
         let mut via_failed = false;
         if via.is_some() && matches!(result, Err(ProviderError::Network(_) | ProviderError::Timeout)) {
             rt.optimizer.record_route_failure(octx, outcome);
             rt.events.warn("optimizer proxy unreachable; request sent direct");
             via_failed = true;
             let opts = CallOptions { base_url_override: direct, ..opts };
-            result = provider.stream(&req, &opts, &on_delta).await;
+            result = stream_attempt(rt, spec, provider.as_ref(), req, &opts).await;
         }
         match result {
             Ok(resp) => return Ok(Answer { resp, model: mref.clone(), via_failed }),
@@ -344,7 +444,7 @@ pub fn run_agent<'a>(
 
             text = resp.text();
             if !text.trim().is_empty() {
-                rt.events.emit(AppEvent::AssistantText { agent_id: spec.id.clone(), text: text.clone() });
+                rt.events.emit(AppEvent::AssistantText { agent_id: spec.id.clone(), text: rt.vault.rehydrate(&text).into_owned() });
             }
             let assistant = Message { role: Role::Assistant, content: resp.content.clone() };
             rt.log(&Entry::Message { agent_id: spec.id.clone(), message: assistant.clone(), ts: chrono::Utc::now() });
@@ -468,6 +568,9 @@ async fn prepare(rt: &Runtime, spec: &AgentSpec, id: String, name: String, mut i
         let hint = if spec.depth == 0 { " Delegate it with Task to an executor domain that has it." } else { "" };
         return Prepared::Done(error_result(&id, format!("Tool `{name}` is not available to {}.{hint}", spec.domain)));
     }
+    if rt.is_deferred_tool(&name) {
+        return Prepared::Done(error_result(&id, format!("Tool `{name}` is not loaded yet: load its server with ToolSearch first.")));
+    }
     if let Some(raw) = input.get(INVALID_JSON_KEY) {
         let raw: String = raw.as_str().unwrap_or("").chars().take(200).collect();
         return Prepared::Done(error_result(
@@ -477,25 +580,82 @@ async fn prepare(rt: &Runtime, spec: &AgentSpec, id: String, name: String, mut i
             ),
         ));
     }
-    if name == TASK_TOOL {
+    if name == TASK_TOOL || name == TOOL_SEARCH {
         return Prepared::Run { id, name, input, tool: None };
     }
     let Some(tool) = rt.tools.get(&name).cloned() else {
         return Prepared::Done(error_result(&id, format!("Unknown tool `{name}`")));
     };
+    // The model only sees placeholders for values the DLP stage masked; the tool, the
+    // hooks, the permission engine and the user see the real ones. The guard judges the
+    // masked input, so real values never reach the Laya server.
+    let model_input = input.clone();
+    let restored = rt.vault.rehydrate_json(&mut input) > 0;
     let hook =
         rt.hooks.run(HookEvent::PreToolUse, Some(&name), &json!({"tool_name": name, "tool_input": input, "agent_id": spec.id})).await;
     if hook.block {
         return Prepared::Done(error_result(&id, format!("Blocked by PreToolUse hook: {}", hook.message.unwrap_or_default())));
     }
+    // A hook rewrite is built from the real values: when a secret was restored, the guard keeps
+    // judging the model's masked input so the secret never reaches the Laya server.
+    let judged = if restored { model_input } else { hook.updated_input.clone().unwrap_or(model_input) };
     if let Some(updated) = hook.updated_input {
         input = updated;
     }
-    match rt.permissions.evaluate(tool.as_ref(), &input, ctx) {
-        PermissionDecision::Allow { .. } => Prepared::Run { id, name, input, tool: Some(tool) },
+    let change = tool.planned_change(&input, ctx);
+    let judged_change = tool.planned_change(&judged, ctx);
+    let mode = rt.permissions.mode();
+    let mut decision = rt.permissions.evaluate(tool.as_ref(), &input, ctx);
+    // A guard review must reach a human: auto mode may not approve it.
+    let mut guarded = false;
+    // Whether a guard judged this call; auto mode runs judged calls and reads without asking.
+    let mut judged_call = false;
+    if !matches!(decision, PermissionDecision::Deny { .. })
+        && let Some(judgement) = guard(rt, &name, &judged, judged_change.as_ref(), ctx).await
+    {
+        judged_call = true;
+        match judgement.verdict {
+            Verdict::Block => {
+                return Prepared::Done(error_result(&id, format!("Blocked by the guard ({}): {}", judgement.source, judgement.reason)));
+            }
+            Verdict::Review if mode == PermissionMode::BypassPermissions => {
+                rt.events.warn(format!("guard flagged `{name}` ({}), not asked in bypassPermissions mode", judgement.reason));
+            }
+            Verdict::Review => {
+                guarded = true;
+                if let PermissionDecision::Allow { .. } = decision {
+                    decision = PermissionDecision::Ask {
+                        reason: format!("guard ({}): {}", judgement.source, judgement.reason),
+                        suggested_rule: None,
+                    };
+                }
+            }
+            Verdict::Allow => {}
+        }
+    }
+    // A masked secret put into a tool that does not write a local file would leave the machine:
+    // the human decides, whatever the mode or the rules.
+    // File editors are exempt only for a file inside the project (not a network share, not a
+    // synced folder elsewhere).
+    let local_write = LOCAL_EDITORS.contains(&name.as_str())
+        && change.as_ref().is_some_and(|c| rt.allowed_roots.iter().any(|root| c.path.starts_with(root)));
+    if restored && !local_write && !matches!(decision, PermissionDecision::Deny { .. }) {
+        decision = PermissionDecision::Ask { reason: format!("inserts a masked secret into {name}"), suggested_rule: None };
+        guarded = true;
+    }
+    // Auto mode runs only what a guard judged, and what only reads without touching the network.
+    if mode == PermissionMode::Auto
+        && !judged_call
+        && !guarded
+        && matches!(decision, PermissionDecision::Allow { .. })
+        && !auto_free(tool.as_ref(), &name)
+    {
+        decision = PermissionDecision::Ask { reason: format!("auto mode asks: no guard judged `{name}`"), suggested_rule: None };
+    }
+    match decision {
+        PermissionDecision::Allow { .. } => run_prepared(rt, id, name, input, tool, change.as_ref()),
         PermissionDecision::Deny { reason } => Prepared::Done(error_result(&id, format!("Permission denied: {reason}"))),
         PermissionDecision::Ask { reason, suggested_rule } => {
-            status(rt, &spec.id, AgentStatus::WaitingApproval);
             let request = ApprovalRequest {
                 id: uuid::Uuid::new_v4().to_string(),
                 agent_id: spec.id.clone(),
@@ -506,20 +666,31 @@ async fn prepare(rt: &Runtime, spec: &AgentSpec, id: String, name: String, mut i
                 suggested_rule: suggested_rule.clone(),
                 preview: input_preview(&name, &input),
             };
+            if !guarded && mode == PermissionMode::Auto && request.risk <= RiskLevel::Moderate {
+                let judgement = rt.advisor.auto_approve(&request, &ctx.goal).await;
+                if judgement.verdict == Verdict::Allow && judgement.confidence >= rt.config.laya.auto_mode.threshold {
+                    rt.events.info(format!(
+                        "auto: `{}` ran without asking ({}, {} confidence {:.2})",
+                        request.summary, judgement.reason, judgement.source, judgement.confidence
+                    ));
+                    return run_prepared(rt, id, name, input, tool, change.as_ref());
+                }
+            }
+            status(rt, &spec.id, AgentStatus::WaitingApproval);
             // An interrupt must not leave the turn waiting for an answer nobody will give.
             let decision = tokio::select! {
                 d = rt.approver.approve(request) => d,
                 () = ctx.cancel.cancelled() => ApprovalDecision::Deny,
             };
             match decision {
-                ApprovalDecision::AllowOnce => Prepared::Run { id, name, input, tool: Some(tool) },
+                ApprovalDecision::AllowOnce => run_prepared(rt, id, name, input, tool, change.as_ref()),
                 ApprovalDecision::AllowAlways => {
                     if let Some(rule) = suggested_rule
                         && let Err(e) = rt.permissions.add_allow_rule(&rule)
                     {
                         rt.events.warn(format!("could not add rule `{rule}`: {e}"));
                     }
-                    Prepared::Run { id, name, input, tool: Some(tool) }
+                    run_prepared(rt, id, name, input, tool, change.as_ref())
                 }
                 ApprovalDecision::Deny => Prepared::Done(error_result(&id, "The user denied this tool call.")),
                 ApprovalDecision::DenyWithFeedback(f) => {
@@ -528,6 +699,34 @@ async fn prepare(rt: &Runtime, spec: &AgentSpec, id: String, name: String, mut i
             }
         }
     }
+}
+
+/// Tools that the auto mode runs without a guard judgement: reads that do not reach outside.
+fn auto_free(tool: &dyn Tool, name: &str) -> bool {
+    tool.is_read_only() && !matches!(name, "WebFetch" | "WebSearch") && !name.starts_with("mcp__")
+}
+
+/// Asks the advisor about a shell command or a file change, when the guard covers it.
+async fn guard(rt: &Runtime, name: &str, input: &Value, change: Option<&PlannedChange>, ctx: &ToolContext) -> Option<Judgement> {
+    let cfg = &rt.config.laya.guard;
+    if let Some(change) = change {
+        return if cfg.files { Some(rt.advisor.judge_write(change, &ctx.goal).await) } else { None };
+    }
+    if name == "Bash" && cfg.commands {
+        let command = input.get("command").and_then(Value::as_str)?;
+        return Some(rt.advisor.judge_command(command, &ctx.workspace, &ctx.goal).await);
+    }
+    None
+}
+
+/// Approved call: snapshots the file it will change for `/rewind`, then lets it run.
+fn run_prepared(rt: &Runtime, id: String, name: String, input: Value, tool: Arc<dyn Tool>, change: Option<&PlannedChange>) -> Prepared {
+    if let Some(change) = change
+        && let Err(e) = rt.checkpoints.before_change(&change.path)
+    {
+        rt.events.warn(format!("no checkpoint for {}: {e}", change.path.display()));
+    }
+    Prepared::Run { id, name, input, tool: Some(tool) }
 }
 
 fn todos_from_input(input: &Value) -> Option<Vec<TodoItem>> {
@@ -564,22 +763,30 @@ async fn run_call(
     let started = Instant::now();
     let result: Result<ToolOutput, ToolError> = match &tool {
         Some(t) => t.call(input.clone(), &ctx).await,
+        None if name == TOOL_SEARCH => Ok(tool_search(rt, &input)),
         None => delegate::run_task(rt, spec, &input, cancel).await,
     };
     let mut output = match result {
         Ok(o) => o,
         Err(e) => ToolOutput::error(e.to_string()),
     };
+    // Hook text joins the result after the optimizer has shortened it, so Triage and Rerank
+    // never drop what the hook added.
+    let mut hook_blocks = Vec::new();
     if tool.is_some() {
         let payload = json!({"tool_name": name, "tool_input": input, "tool_response": output.text_content(), "agent_id": spec.id});
         let hook = rt.hooks.run(HookEvent::PostToolUse, Some(&name), &payload).await;
         if hook.block {
-            output.content.push(ContentBlock::text(format!("[PostToolUse hook] {}", hook.message.unwrap_or_default())));
+            hook_blocks.push(ContentBlock::text(format!("[PostToolUse hook] {}", hook.message.unwrap_or_default())));
         }
         if let Some(extra) = hook.additional_context {
-            output.content.push(ContentBlock::text(extra));
+            hook_blocks.push(ContentBlock::text(extra));
         }
+        let goal = rt.goal(&spec.id);
+        let octx = optimize_context(rt, spec, &spec.profile.model_ref());
+        rt.optimizer.after_tool(&name, &input, &mut output, &goal, &octx).await;
     }
+    output.content.extend(hook_blocks);
     if name == "TodoWrite"
         && !output.is_error
         && let Some(items) = todos_from_input(&input)

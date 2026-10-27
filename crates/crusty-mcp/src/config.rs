@@ -83,19 +83,14 @@ fn parse_servers(text: &str, path: &Path) -> Result<BTreeMap<String, McpServerCo
         Some(_) => return Err(invalid(path, "`mcpServers` must be an object")),
     };
     for (name, entry) in entries {
+        let mut server: McpServerConfig =
+            serde_json::from_value(entry.clone()).map_err(|source| McpError::Json { path: path.to_path_buf(), source })?;
         if let Some(kind) = entry.get("type").filter(|kind| !kind.is_null()) {
-            if kind.as_str() == Some("sse") {
-                return Err(invalid(
-                    path,
-                    format!("server `{name}`: legacy SSE transport is not supported; use the streamable HTTP endpoint"),
-                ));
-            }
-            if !matches!(kind.as_str(), Some("stdio" | "http")) {
-                return Err(invalid(path, format!("server `{name}`: unsupported type {kind}")));
+            match kind.as_str() {
+                Some(known @ ("stdio" | "http" | "sse")) => server.transport = Some(known.to_owned()),
+                _ => return Err(invalid(path, format!("server `{name}`: unsupported type {kind}"))),
             }
         }
-        let server: McpServerConfig =
-            serde_json::from_value(entry.clone()).map_err(|source| McpError::Json { path: path.to_path_buf(), source })?;
         servers.insert(name.clone(), server);
     }
     Ok(servers)
@@ -158,11 +153,12 @@ mod tests {
     }
 
     #[test]
-    fn sse_type_is_rejected_with_a_clear_message() {
+    fn sse_type_sets_the_transport() {
         let dir = scratch_dir("sse");
         std::fs::write(dir.join(MCP_JSON), r#"{"mcpServers":{"old":{"type":"sse","url":"https://x.test/sse"}}}"#).expect("write");
-        let Err(McpError::Invalid { message, .. }) = load_mcp_json(&dir) else { panic!("sse must be rejected") };
-        assert_eq!(message, "server `old`: legacy SSE transport is not supported; use the streamable HTTP endpoint");
+        let servers = load_mcp_json(&dir).expect("sse is valid");
+        assert_eq!(servers["old"].transport.as_deref(), Some("sse"));
+        assert_eq!(servers["old"].url.as_deref(), Some("https://x.test/sse"));
     }
 
     #[test]

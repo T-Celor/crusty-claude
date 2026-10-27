@@ -8,7 +8,7 @@ use crusty_core::tool::{input_opt_str, input_str, preview_of};
 use crusty_core::{AppEvent, CancellationToken, Message, ModelRef, ToolError, ToolOutput, ToolSpec};
 use serde_json::{Value, json};
 
-use crate::engine::{AgentSpec, StopKind, TASK_TOOL, run_agent};
+use crate::engine::{AgentSpec, StopKind, TASK_TOOL, TOOL_SEARCH, run_agent};
 use crate::prompts;
 use crate::runtime::Runtime;
 
@@ -46,16 +46,27 @@ pub fn summarize(input: &Value) -> String {
 /// Tool names an executor of this domain gets: the domain's list (an `mcp__server` entry
 /// covers that server's tools) or every registered tool, never `Task` unless depth allows.
 fn executor_tools(rt: &Runtime, listed: Option<&[String]>, depth: u32) -> Vec<String> {
+    let registered: Vec<&str> = rt.tools.keys().map(String::as_str).collect();
+    tool_names(&registered, listed, depth < rt.config.orchestrator.max_depth)
+}
+
+/// The name rule of `executor_tools`: `delegable` says whether `Task` is offered.
+fn tool_names(registered: &[&str], listed: Option<&[String]>, delegable: bool) -> Vec<String> {
     let mut tools: Vec<String> = match listed {
-        Some(names) => rt
-            .tools
-            .keys()
-            .filter(|k| names.iter().any(|n| n == *k || (n.starts_with("mcp__") && k.starts_with(&format!("{n}__")))))
-            .cloned()
+        Some(names) => registered
+            .iter()
+            .copied()
+            .filter(|k| names.iter().any(|n| n.as_str() == *k || (n.starts_with("mcp__") && k.starts_with(&format!("{n}__")))))
+            .map(str::to_owned)
             .collect(),
-        None => rt.tools.keys().cloned().collect(),
+        None => registered.iter().copied().map(str::to_owned).collect(),
     };
-    if depth < rt.config.orchestrator.max_depth {
+    // `ToolSearch` is handled by the engine, so it is not a registered tool. An MCP entry
+    // needs it to load the server's tools.
+    if listed.is_none_or(|names| names.iter().any(|n| n == TOOL_SEARCH || n.starts_with("mcp__"))) {
+        tools.push(TOOL_SEARCH.into());
+    }
+    if delegable {
         tools.push(TASK_TOOL.into());
     }
     tools
@@ -147,4 +158,25 @@ pub async fn run_task(rt: &Arc<Runtime>, parent: &AgentSpec, input: &Value, canc
     let body = if outcome.text.trim().is_empty() { "(the executor returned no text)".to_owned() } else { outcome.text };
     let text = format!("{body}\n\n{footer}");
     Ok(if matches!(outcome.stop, StopKind::Error(_)) { ToolOutput::error(text) } else { ToolOutput::text(text) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_entry_brings_tool_search() {
+        let listed = vec!["mcp__docs".to_owned()];
+        let tools = tool_names(&["mcp__docs__search", "Read"], Some(&listed), false);
+        assert!(tools.contains(&"mcp__docs__search".to_owned()));
+        assert!(tools.contains(&TOOL_SEARCH.to_owned()));
+        assert!(!tools.contains(&"Read".to_owned()));
+        assert!(!tools.contains(&TASK_TOOL.to_owned()));
+    }
+
+    #[test]
+    fn plain_domain_has_no_tool_search() {
+        let listed = vec!["Read".to_owned()];
+        assert!(!tool_names(&["mcp__docs__search", "Read"], Some(&listed), true).contains(&TOOL_SEARCH.to_owned()));
+    }
 }

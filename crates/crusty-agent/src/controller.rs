@@ -2,9 +2,10 @@
 //! `!shell` lines and `#memory` notes. One orchestrator turn runs at a time; prompts typed
 //! meanwhile are queued.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use crusty_core::advisor::{AdviceSource, McpServerSummary};
 use crusty_core::hooks::HookEvent;
 use crusty_core::{AppEvent, CancellationToken, ContentBlock, Message, Role, UiCommand};
 use crusty_session::commands::CustomCommand;
@@ -15,7 +16,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 
 use crate::approval::ChannelApprover;
-use crate::engine::{ORCHESTRATOR_ID, StopKind, orchestrator_spec, run_agent};
+use crate::engine::{ORCHESTRATOR_ID, StopKind, mcp_server, orchestrator_spec, run_agent};
 use crate::runtime::Runtime;
 use crate::{commands, sessions_dir};
 
@@ -53,6 +54,65 @@ pub async fn prepare_prompt(rt: &Runtime, prompt: &str) -> Option<Message> {
         msg.content.push(ContentBlock::text(extra));
     }
     Some(msg)
+}
+
+/// The model router: picks the orchestrator's tier from the prompt, unless the user pinned a
+/// model (`/model`) or the tier is already chosen for this session (`every_prompt` re-routes).
+async fn route_turn(rt: &Runtime, prompt: &str) {
+    let cfg = &rt.config.laya.router;
+    let settings = rt.settings();
+    if !cfg.enabled || settings.orchestrator_pinned || (settings.routed_tier.is_some() && !cfg.every_prompt) {
+        return;
+    }
+    let routing = rt.advisor.route(prompt).await;
+    if routing.source == AdviceSource::None || routing.confidence < cfg.min_confidence {
+        return;
+    }
+    let tier = routing.tier.as_str();
+    let Some(over) = cfg.tiers.get(tier) else {
+        return;
+    };
+    let model = settings.orchestrator.apply(over);
+    let mref = model.model_ref();
+    rt.update_settings(|s| {
+        s.orchestrator = model;
+        s.routed_tier = Some(tier.to_owned());
+    });
+    rt.events.emit(AppEvent::ModelChanged { target: ORCHESTRATOR_ID.into(), model: mref.to_string() });
+}
+
+/// Intent detection: MCP servers the prompt does not need are deferred behind `ToolSearch`.
+async fn defer_mcp_tools(rt: &Runtime, prompt: &str) {
+    let cfg = &rt.config.laya.intent;
+    if !cfg.enabled || !cfg.defer_mcp_tools {
+        return;
+    }
+    let mut servers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, tool) in &rt.tools {
+        if let Some(server) = mcp_server(name) {
+            let first = tool.spec().description.split('.').next().unwrap_or("").trim().to_owned();
+            servers.entry(server.to_owned()).or_default().push(format!("{name}: {first}"));
+        }
+    }
+    let summaries: Vec<McpServerSummary> = servers.into_iter().map(|(name, tools)| McpServerSummary { name, tools }).collect();
+    let intent = rt.advisor.intent(prompt, &summaries).await;
+    let mut deferred = BTreeSet::new();
+    if intent.source != AdviceSource::None && intent.server_relevance.len() == summaries.len() {
+        for (summary, relevance) in summaries.iter().zip(&intent.server_relevance) {
+            if *relevance < cfg.min_relevance && !cfg.always_load.contains(&summary.name) {
+                deferred.insert(summary.name.clone());
+            }
+        }
+    }
+    rt.set_deferred_servers(deferred);
+}
+
+/// Starts the `/rewind` checkpoint of a prompt; the label is its first line.
+fn begin_checkpoint(rt: &Runtime, prompt: &str, message_index: usize) {
+    let label: String = prompt.lines().next().unwrap_or("").chars().take(60).collect();
+    if let Some(id) = rt.checkpoints.begin(&label, message_index) {
+        rt.events.emit(AppEvent::CheckpointCreated { id, label });
+    }
 }
 
 /// Replays a loaded conversation to the UI (text only).
@@ -243,6 +303,10 @@ impl Controller {
         let Some(message) = prepare_prompt(&self.rt, &prompt).await else {
             return;
         };
+        route_turn(&self.rt, &prompt).await;
+        defer_mcp_tools(&self.rt, &prompt).await;
+        let index = self.convo.lock().await.len();
+        begin_checkpoint(&self.rt, &prompt, index);
         self.rt.reset_turn_counters();
         self.rt.events.emit(AppEvent::UserMessage { text: prompt });
         let rt = self.rt.clone();
@@ -277,7 +341,9 @@ impl Controller {
         let id = transcript::new_session_id();
         self.convo.lock().await.clear();
         self.rt.clear_plans();
+        let old = self.rt.session_id();
         self.rt.set_session_id(id.clone());
+        self.rt.forget_conversation(&[old.as_str(), id.as_str()]);
         let dir = sessions_dir(&self.rt);
         match Transcript::create(&dir, &id, &self.rt.workspace) {
             Ok(t) => self.rt.set_transcript(Some(t)),
@@ -296,7 +362,9 @@ impl Controller {
             self.rt.events.warn(w.clone());
         }
         let transcript = Transcript::open_append(path).map_err(|e| e.to_string())?;
+        let old = self.rt.session_id();
         self.rt.set_session_id(loaded.session_id.clone());
+        self.rt.forget_conversation(&[old.as_str(), loaded.session_id.as_str()]);
         self.rt.set_transcript(Some(transcript));
         self.rt.clear_plans();
         self.rt.events.emit(AppEvent::ConversationReset { session_id: loaded.session_id.clone() });

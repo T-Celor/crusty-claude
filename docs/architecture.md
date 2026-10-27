@@ -1,6 +1,6 @@
 # Architecture
 
-Crusty-Claude est un workspace Cargo de 17 crates. `crusty-core` définit les contrats
+Crusty-Claude est un workspace Cargo de 20 crates. `crusty-core` définit les contrats
 (types et traits) ; chaque autre crate n'en dépend que par ces contrats, ce qui permet de les
 développer et de les tester séparément. Le binaire `crusty` (crate `crusty-cli`) assemble tout.
 
@@ -22,6 +22,11 @@ développer et de les tester séparément. Le binaire `crusty` (crate `crusty-cl
 | `crusty-agent` | moteur orchestrateur/exécuteur, délégation `Task`, compaction, contrôleur de session, commandes slash, mode `-p` | core, session |
 | `crusty-proxy` | proxy HTTP optimisant compatible Anthropic, sondes de santé des proxies externes | core |
 | `crusty-tui` | interface ratatui : conversation, exécution, journal, panneau d'optimisation, agents, plan, approbations | core |
+| `crusty-sandbox` | isolation OS des commandes Bash (bubblewrap/Landlock, Seatbelt, Job Object) | core |
+| `crusty-laya` | client `laya-serve` (`noul`, `choice`, `score`) | core |
+| `crusty-advisor` | points d'intégration Laya B0–B10 et replis natifs | core, laya |
+| `crusty-dlp` | masquage des secrets et PII sortants, réhydratation locale | core |
+| `crusty-acp` | Agent Client Protocol sur stdio (`crusty acp`) | core, agent |
 | `crusty-cli` | binaire `crusty` : arguments, câblage, sous-commandes | tous |
 
 ## Flux d'une requête

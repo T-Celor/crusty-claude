@@ -1,4 +1,5 @@
 use super::*;
+use crusty_core::tool::ToolOutput;
 use crusty_core::{ContentBlock, Message, Role};
 use tokio::sync::mpsc;
 
@@ -74,7 +75,7 @@ async fn disabled_optimizer_passes_through() {
     let original = req.clone();
     let out = p.optimize(&mut req, &ctx(1_000_000)).await;
     assert_eq!(req, original);
-    assert!(out.stages.is_empty());
+    assert!(out.stages.iter().all(|m| m.stage == Stage::Dlp), "only DLP runs while disabled");
     assert_eq!(out.route, Route::Direct);
 }
 
@@ -242,4 +243,169 @@ fn filters_follow_switches() {
     assert!(p.html_to_markdown(html, "https://x.test").is_none());
     p.set_stage_enabled(Stage::Rtk, false).unwrap();
     assert!(p.command_output("git status", "On branch main\n", Some(0)).is_none());
+}
+
+/// A fake Anthropic key: the `sk-ant-` pattern matches it with certainty.
+const FAKE_KEY: &str = "sk-ant-api03-0123456789abcdefghijABCDEFGHIJ0123456789";
+
+fn user_request(text: &str) -> ChatRequest {
+    let mut req = ChatRequest::new("claude-opus-5-5", 1000);
+    req.messages.push(Message::user_text(text));
+    req
+}
+
+#[tokio::test]
+async fn dlp_masks_secrets_even_when_the_optimizer_is_disabled() {
+    let (p, mut rx) = pipeline(|c| c.optimizer.enabled = false);
+    let mut req = user_request(&format!("use key {FAKE_KEY} please"));
+    let out = p.optimize(&mut req, &ctx(1_000_000)).await;
+    let text = serde_json::to_string(&req).unwrap();
+    assert!(!text.contains(FAKE_KEY));
+    assert!(text.contains("SECRET_1"));
+    assert_eq!(stage(&out, Stage::Dlp).unwrap().status, StageStatus::Applied);
+    let mut redacted = false;
+    while let Ok(ev) = rx.try_recv() {
+        redacted |= matches!(ev, AppEvent::Redacted { secrets: 1, .. });
+    }
+    assert!(redacted);
+}
+
+#[tokio::test]
+async fn dlp_is_skipped_for_the_proxy_agent() {
+    let (p, _rx) = pipeline(|_| {});
+    let mut req = user_request(FAKE_KEY);
+    let mut c = ctx(1_000_000);
+    c.agent_id = "proxy".into();
+    let out = p.optimize(&mut req, &c).await;
+    assert!(stage(&out, Stage::Dlp).is_none());
+    assert!(serde_json::to_string(&req).unwrap().contains(FAKE_KEY));
+}
+
+/// A session where `src/lib.rs` is read, then read again: the first result is superseded.
+fn reread_request() -> ChatRequest {
+    fn read(id: &str, text: &str) -> Vec<Message> {
+        vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(id, "Read", serde_json::json!({"file_path": "src/lib.rs"}))],
+            },
+            Message { role: Role::User, content: vec![ContentBlock::tool_result(id, vec![ContentBlock::text(text)], false)] },
+        ]
+    }
+    let mut req = ChatRequest::new("claude-opus-5-5", 1000);
+    req.messages.push(Message::user_text("review the lib"));
+    req.messages.extend(read("r1", &dense_block()));
+    req.messages.extend(read("r2", "the file changed, here is the new version"));
+    for _ in 0..7 {
+        req.messages.push(Message::assistant_text("ok"));
+        req.messages.push(Message::user_text("next"));
+    }
+    req
+}
+
+fn prune_pipeline(mode: OptimizerMode) -> (Pipeline, mpsc::UnboundedReceiver<AppEvent>) {
+    pipeline(|c| {
+        c.laya.pruner.batch_messages = 1;
+        c.optimizer.mode = mode;
+        c.optimizer.headroom.enabled = false;
+        c.optimizer.context_gate.enabled = false;
+    })
+}
+
+#[tokio::test]
+async fn prune_supersedes_a_stale_read_and_stays_byte_stable() {
+    let (p, _rx) = prune_pipeline(OptimizerMode::Active);
+    let original = reread_request();
+    let mut first = original.clone();
+    let out = p.optimize(&mut first, &ctx(1_000_000)).await;
+    assert_eq!(stage(&out, Stage::Prune).unwrap().status, StageStatus::Applied);
+    let text = serde_json::to_string(&first).unwrap();
+    assert!(text.contains("[stale: superseded by a later read"));
+    assert!(!text.contains("compute_result"), "the superseded body is gone");
+    let mut second = original.clone();
+    p.optimize(&mut second, &ctx(1_000_000)).await;
+    assert_eq!(first, second, "same replacements, byte for byte");
+}
+
+#[tokio::test]
+async fn observe_mode_leaves_stale_reads_alone() {
+    let (p, _rx) = prune_pipeline(OptimizerMode::Observe);
+    let original = reread_request();
+    let mut req = original.clone();
+    let out = p.optimize(&mut req, &ctx(1_000_000)).await;
+    assert_eq!(req, original);
+    assert_eq!(stage(&out, Stage::Prune).unwrap().status, StageStatus::Observed);
+}
+
+/// A 200-line build log whose only error is at line 101.
+fn failing_build_log() -> String {
+    (0..200)
+        .map(|i| if i == 100 { "error[E0308]: mismatched types".to_owned() } else { format!("   Compiling dep-{i} v0.{i}.0") })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn triage_keeps_the_error_of_a_failed_build() {
+    let (p, _rx) = pipeline(|_| {});
+    let log = failing_build_log();
+    let mut out = ToolOutput::error(log.clone()).with_exit_code(Some(101));
+    p.after_tool("Bash", &serde_json::json!({"command": "cargo build"}), &mut out, "fix the build", &ctx(1_000_000)).await;
+    let text = out.text_content();
+    assert!(text.contains("error[E0308]: mismatched types"));
+    assert!(text.len() < log.len());
+    assert!(text.contains("Retrieve(\"orig_"));
+}
+
+#[tokio::test]
+async fn rerank_keeps_the_lines_that_match_the_goal() {
+    let (p, _rx) = pipeline(|c| c.laya.rerank.keep = 5);
+    let mut lines: Vec<String> = (0..50).map(|i| format!("src/module_{i}.rs:{i}: unrelated helper code")).collect();
+    lines[37] = "src/vault.rs:12: fn rehydrate restores the vault placeholder".into();
+    let mut out = ToolOutput::text(lines.join("\n"));
+    p.after_tool("Grep", &serde_json::json!({"pattern": "rehydrate"}), &mut out, "rehydrate the vault placeholder", &ctx(1_000_000)).await;
+    let text = out.text_content();
+    assert!(text.contains("src/vault.rs:12"));
+    assert!(text.contains("[rerank: kept 5 of 50 results by relevance to the task]"));
+    assert!(text.lines().count() <= 7, "five lines, the note and the retrieve line");
+}
+
+#[tokio::test]
+async fn successful_bash_output_is_left_alone() {
+    let (p, _rx) = pipeline(|_| {});
+    let log = failing_build_log();
+    let mut out = ToolOutput::text(log.clone()).with_exit_code(Some(0));
+    p.after_tool("Bash", &serde_json::json!({"command": "cargo build"}), &mut out, "fix the build", &ctx(1_000_000)).await;
+    assert_eq!(out.text_content(), log);
+    assert!(!out.is_error);
+}
+
+#[tokio::test]
+async fn rerank_leaves_error_output_alone() {
+    let (p, _rx) = pipeline(|c| c.laya.rerank.keep = 5);
+    let lines: Vec<String> = (0..50).map(|i| format!("src/module_{i}.rs:{i}: unrelated helper code")).collect();
+    let text = lines.join("\n");
+    let mut out = ToolOutput::error(text.clone());
+    p.after_tool("Grep", &serde_json::json!({"pattern": "rehydrate"}), &mut out, "rehydrate the vault placeholder", &ctx(1_000_000)).await;
+    assert_eq!(out.text_content(), text);
+    assert!(out.is_error);
+}
+
+#[tokio::test]
+async fn forget_session_drops_the_prune_frontier_and_recomputes() {
+    let (p, _rx) = prune_pipeline(OptimizerMode::Active);
+    let original = reread_request();
+    let mut first = original.clone();
+    p.optimize(&mut first, &ctx(1_000_000)).await;
+    let frontier = |p: &Pipeline| p.prune.lock().unwrap_or_else(|e| e.into_inner()).frontier_of("s");
+    let kept = frontier(&p);
+    assert!(kept > 0, "the first optimize advanced the frontier");
+
+    p.forget_session("s");
+    assert_eq!(frontier(&p), 0, "forgotten session has no frontier");
+
+    let mut again = original.clone();
+    p.optimize(&mut again, &ctx(1_000_000)).await;
+    assert_eq!(frontier(&p), kept, "the next optimize recomputed the frontier from scratch");
+    assert_eq!(first, again, "same decisions from scratch");
 }

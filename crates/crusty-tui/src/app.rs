@@ -8,12 +8,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crusty_core::checkpoint::{CheckpointSummary, RewindScope};
 use crusty_core::config::Config;
 use crusty_core::event::{AgentStatus, AppEvent, TodoItem, UiCommand};
 use crusty_core::metrics::{Metrics, MetricsSnapshot};
 use crusty_core::permission::{ApprovalDecision, ApprovalRequest, PermissionMode};
 
 use crate::TuiOptions;
+use crate::complete;
 use crate::input::Editor;
 
 /// Executor and tool runs kept for the Exec tab.
@@ -24,6 +26,41 @@ const DOUBLE_CTRL_C: Duration = Duration::from_secs(2);
 const PAGE: usize = 10;
 /// Maximum rows of the slash-command completion popup.
 pub const COMPLETION_ROWS: usize = 8;
+/// Window in which a second Esc on an empty input opens the rewind picker.
+const DOUBLE_ESC: Duration = Duration::from_millis(500);
+/// Recently mentioned files kept for ranking.
+const RECENT_MAX: usize = 20;
+
+/// One row of the completion popup. `insert` is the whole input text after accepting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    /// Shown in the popup: `/name` or a relative path.
+    pub label: String,
+    /// Description shown after the label (commands only).
+    pub detail: String,
+    /// Input text after the item is accepted.
+    pub insert: String,
+    /// Whether the item is a file (remembered as recently mentioned).
+    pub file: bool,
+}
+
+/// The checkpoint picker opened by `CheckpointList`, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewindPicker {
+    /// Checkpoints, sorted by id descending.
+    pub items: Vec<CheckpointSummary>,
+    /// Index into `items` of the highlighted row.
+    pub selected: usize,
+}
+
+/// Short name of a rewind scope for messages.
+pub fn scope_label(scope: RewindScope) -> &'static str {
+    match scope {
+        RewindScope::Code => "code",
+        RewindScope::Conversation => "conversation",
+        RewindScope::Both => "both",
+    }
+}
 
 /// The main tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +168,22 @@ pub struct App {
     redraw: bool,
     /// Counts ticks; drives the spinners.
     pub(crate) spinner: usize,
+    /// Relative paths of the workspace, for `@` completion.
+    files: Vec<String>,
+    /// Files mentioned or accepted recently, newest first.
+    recent_files: Vec<String>,
+    /// How often each slash command was submitted in this session.
+    command_usage: HashMap<String, u32>,
+    /// Highlighted row of the completion popup.
+    pub(crate) completion_sel: usize,
+    /// Time of the last Esc on an empty input, for the double-Esc rewind.
+    last_esc: Option<Instant>,
+    /// The checkpoint picker, while open.
+    pub(crate) rewind: Option<RewindPicker>,
+    /// Id of the newest checkpoint created in this session.
+    pub(crate) last_checkpoint: Option<u32>,
+    /// Set by Ctrl+R: the caller rebuilds the file index.
+    index_refresh: bool,
 }
 
 impl App {
@@ -167,7 +220,38 @@ impl App {
             quit: false,
             redraw: false,
             spinner: 0,
+            files: Vec::new(),
+            recent_files: Vec::new(),
+            command_usage: HashMap::new(),
+            completion_sel: 0,
+            last_esc: None,
+            rewind: None,
+            last_checkpoint: None,
+            index_refresh: false,
         }
+    }
+
+    /// Replaces the file index used by `@` completion.
+    pub fn set_file_index(&mut self, files: Vec<String>) {
+        self.files = files;
+    }
+
+    /// Returns true once after Ctrl+R, when the file index must be rebuilt.
+    pub fn take_index_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.index_refresh)
+    }
+
+    /// The most recent submitted prompt that starts with the typed text, as shown dimmed
+    /// after the cursor. `None` while the popup is open or the cursor is not at the end.
+    pub fn history_suggestion(&self) -> Option<&str> {
+        let text = self.input.text();
+        if text.is_empty() || text.contains('\n') || self.input.cursor() != text.chars().count() {
+            return None;
+        }
+        if !self.completion_items().is_empty() {
+            return None;
+        }
+        self.input.history().iter().rev().find(|h| h.len() > text.len() && h.starts_with(text)).map(String::as_str)
     }
 
     /// The configuration the UI was started with.
@@ -230,21 +314,99 @@ impl App {
         changed
     }
 
-    /// Slash commands whose name starts with the typed prefix. Empty unless the input is
-    /// `/prefix` with no space yet and the popup has not been dismissed with Esc.
-    pub fn completion_matches(&self) -> Vec<&(String, String)> {
+    /// Rows of the completion popup. Slash commands for `/prefix` (most used first), files
+    /// for an `@query` token. Empty when the popup is dismissed with Esc or nothing matches.
+    pub fn completion_items(&self) -> Vec<CompletionItem> {
         if self.completion_off {
             return Vec::new();
         }
-        let Some(prefix) = self.completion_prefix() else {
-            return Vec::new();
-        };
-        self.commands.iter().filter(|(name, _)| name.starts_with(prefix)).collect()
+        if let Some(prefix) = self.completion_prefix() {
+            let mut matches: Vec<&(String, String)> = self.commands.iter().filter(|(n, _)| n.starts_with(prefix)).collect();
+            matches.sort_by_key(|(n, _)| std::cmp::Reverse(self.command_usage.get(n.as_str()).copied().unwrap_or(0)));
+            return matches
+                .into_iter()
+                .map(|(n, d)| CompletionItem { label: format!("/{n}"), detail: d.clone(), insert: format!("/{n} "), file: false })
+                .collect();
+        }
+        if let Some((start, query)) = self.file_token() {
+            let text = self.input.text();
+            return complete::rank_files(&self.files, query, &self.recent_files, COMPLETION_ROWS)
+                .into_iter()
+                .map(|p| CompletionItem { insert: format!("{}@{p} ", &text[..start]), label: p, detail: String::new(), file: true })
+                .collect();
+        }
+        Vec::new()
     }
 
     fn completion_prefix(&self) -> Option<&str> {
         let rest = self.input.text().strip_prefix('/')?;
         (!rest.contains(char::is_whitespace)).then_some(rest)
+    }
+
+    /// The last whitespace-separated token when it starts with `@`: its byte offset and the
+    /// query after the `@`.
+    fn file_token(&self) -> Option<(usize, &str)> {
+        let text = self.input.text();
+        let start = text.char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
+        let query = text[start..].strip_prefix('@')?;
+        Some((start, query))
+    }
+
+    /// Moves the popup highlight by `step`, wrapping around `len` rows.
+    fn move_selection(&mut self, step: isize, len: usize) {
+        let len = len as isize;
+        self.completion_sel = (self.completion_sel as isize + step).rem_euclid(len) as usize;
+    }
+
+    /// Puts the highlighted popup row into the input and remembers it if it is a file.
+    fn accept_selected(&mut self, items: &[CompletionItem]) {
+        let Some(item) = items.get(self.completion_sel).or(items.first()) else {
+            return;
+        };
+        if item.file {
+            self.remember_file(&item.label.clone());
+        }
+        self.input.set_text(&item.insert);
+    }
+
+    /// Moves a file to the front of the recently mentioned list.
+    fn remember_file(&mut self, path: &str) {
+        self.recent_files.retain(|p| p != path);
+        self.recent_files.insert(0, path.to_string());
+        self.recent_files.truncate(RECENT_MAX);
+    }
+
+    /// Keys while the checkpoint picker is open: ↑/↓ select, `c` code, `v` conversation,
+    /// Enter both, Esc closes.
+    fn handle_rewind_key(&mut self, key: KeyEvent) -> Vec<UiCommand> {
+        let Some(picker) = self.rewind.as_mut() else {
+            return Vec::new();
+        };
+        let last = picker.items.len().saturating_sub(1);
+        let scope = match key.code {
+            KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+                return Vec::new();
+            }
+            KeyCode::Down => {
+                picker.selected = (picker.selected + 1).min(last);
+                return Vec::new();
+            }
+            KeyCode::Char('c') => "code",
+            KeyCode::Char('v') => "conversation",
+            KeyCode::Enter => "both",
+            KeyCode::Esc => {
+                self.rewind = None;
+                return Vec::new();
+            }
+            _ => return Vec::new(),
+        };
+        let id = picker.items.get(picker.selected).map(|i| i.id);
+        self.rewind = None;
+        match id {
+            Some(id) => self.submit_text(&format!("/rewind {id} {scope}")),
+            None => Vec::new(),
+        }
     }
 
     /// Applies one engine event to the state.
@@ -431,6 +593,20 @@ impl App {
                 self.scroll_back = 0;
                 self.context_pct = None;
             }
+            AppEvent::CheckpointCreated { id, .. } => self.last_checkpoint = Some(id),
+            AppEvent::CheckpointList { mut items } => {
+                if items.is_empty() {
+                    self.entries.push(Entry::Info("no checkpoints yet".into()));
+                } else {
+                    items.sort_by_key(|i| std::cmp::Reverse(i.id));
+                    self.rewind = Some(RewindPicker { items, selected: 0 });
+                }
+            }
+            AppEvent::Rewound { id, scope, files_restored, failures } => {
+                self.entries
+                    .push(Entry::Info(format!("rewound to checkpoint {id} ({}): {files_restored} files restored", scope_label(scope))));
+                self.entries.extend(failures.into_iter().map(|f| Entry::Warning(format!("could not restore {f}"))));
+            }
             AppEvent::Shutdown => self.quit = true,
             // Optimizer, gate, proxy, graph and policy events reach the screen through the
             // metrics snapshot, so they need no state of their own here.
@@ -443,11 +619,31 @@ impl App {
         if !self.approvals.is_empty() {
             return self.handle_approval_key(key);
         }
+        if self.rewind.is_some() {
+            return self.handle_rewind_key(key);
+        }
+        let before = self.input.text().to_string();
+        let cmds = self.edit_key(key);
+        if self.input.text() != before {
+            self.completion_sel = 0;
+        }
+        cmds
+    }
+
+    /// Editing, history, completion and submit keys.
+    fn edit_key(&mut self, key: KeyEvent) -> Vec<UiCommand> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let items = self.completion_items();
+        let popup = !items.is_empty();
         match key.code {
             KeyCode::Enter if shift || alt => self.input.newline(),
+            KeyCode::Enter
+                if popup && items.get(self.completion_sel).is_some_and(|i| i.insert.trim_end() != self.input.text().trim_end()) =>
+            {
+                self.accept_selected(&items);
+            }
             KeyCode::Enter => return self.submit_input(),
             KeyCode::Char('j') if ctrl => self.input.newline(),
             KeyCode::Char('c') if ctrl => return self.ctrl_c(),
@@ -465,6 +661,7 @@ impl App {
             KeyCode::Char('t') if ctrl => self.show_panel = !self.show_panel,
             KeyCode::Char('o') if ctrl => self.show_thinking = !self.show_thinking,
             KeyCode::Char('l') if ctrl => self.redraw = true,
+            KeyCode::Char('r') if ctrl => self.index_refresh = true,
             KeyCode::Char(c) if !ctrl && !alt => {
                 self.input.insert_char(c);
                 self.completion_off = false;
@@ -472,9 +669,14 @@ impl App {
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
             KeyCode::Left => self.input.left(),
-            KeyCode::Right => self.input.right(),
+            KeyCode::Right => match self.history_suggestion().map(str::to_string) {
+                Some(full) => self.input.set_text(&full),
+                None => self.input.right(),
+            },
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
+            KeyCode::Up if popup => self.move_selection(-1, items.len()),
+            KeyCode::Down if popup => self.move_selection(1, items.len()),
             KeyCode::Up => {
                 if self.input.on_first_line() {
                     self.input.history_prev();
@@ -489,11 +691,22 @@ impl App {
                     self.input.down();
                 }
             }
-            KeyCode::Tab => self.complete(),
+            KeyCode::Tab if popup => self.complete(&items),
+            KeyCode::BackTab if popup => self.move_selection(-1, items.len()),
             KeyCode::BackTab => return vec![UiCommand::SetPermissionMode(self.mode.next())],
+            KeyCode::Esc if popup => self.completion_off = true,
             KeyCode::Esc => {
                 if self.busy {
+                    self.last_esc = None;
                     return vec![UiCommand::Interrupt];
+                }
+                if self.input.is_empty() {
+                    let now = Instant::now();
+                    if self.last_esc.is_some_and(|prev| now.duration_since(prev) <= DOUBLE_ESC) {
+                        self.last_esc = None;
+                        return self.submit_text("/rewind");
+                    }
+                    self.last_esc = Some(now);
                 }
                 self.completion_off = true;
             }
@@ -537,7 +750,13 @@ impl App {
         if text.is_empty() {
             return Vec::new();
         }
-        if text.starts_with('/') {
+        for path in text.split_whitespace().filter_map(|w| w.strip_prefix('@')) {
+            self.remember_file(path);
+        }
+        if let Some(rest) = text.strip_prefix('/') {
+            if let Some(name) = rest.split_whitespace().next() {
+                *self.command_usage.entry(name.to_string()).or_insert(0) += 1;
+            }
             self.entries.push(Entry::Command { command: text.to_string(), output: String::new() });
         } else {
             self.busy = true;
@@ -568,24 +787,20 @@ impl App {
         Vec::new()
     }
 
-    /// Tab on a `/prefix`: completes the only match, or extends to the common prefix.
-    fn complete(&mut self) {
-        let Some(prefix) = self.completion_prefix().map(str::to_string) else {
-            return;
-        };
-        let names: Vec<String> = self.completion_matches().iter().map(|(name, _)| name.clone()).collect();
-        match names.as_slice() {
-            [] => {}
-            [only] => self.input.set_text(&format!("/{only} ")),
-            [first, ..] => {
-                let common = common_prefix(&names);
-                if common.len() > prefix.len() {
-                    self.input.set_text(&format!("/{common}"));
-                } else {
-                    self.input.set_text(&format!("/{first} "));
-                }
+    /// Tab with the popup open: extends a `/prefix` to the common prefix of several
+    /// commands, else accepts the highlighted row.
+    fn complete(&mut self, items: &[CompletionItem]) {
+        if items.len() > 1
+            && let Some(prefix) = self.completion_prefix().map(str::to_string)
+        {
+            let names: Vec<String> = items.iter().map(|i| i.label.trim_start_matches('/').to_string()).collect();
+            let common = common_prefix(&names);
+            if common.len() > prefix.len() {
+                self.input.set_text(&format!("/{common}"));
+                return;
             }
         }
+        self.accept_selected(items);
     }
 
     /// Keys while an approval is pending: they go to the approval modal only.
@@ -756,7 +971,63 @@ mod tests {
         type_str(&mut app, "/he");
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.input.text(), "/help ");
-        assert!(app.completion_matches().is_empty());
+        assert!(app.completion_items().is_empty());
+    }
+
+    #[test]
+    fn at_popup_filters_and_tab_accepts_file() {
+        let mut app = App::new(&opts());
+        app.set_file_index(vec!["src/main.rs".into(), "README.md".into()]);
+        type_str(&mut app, "open @ma");
+        let items = app.completion_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "src/main.rs");
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.input.text(), "open @src/main.rs ");
+    }
+
+    #[test]
+    fn slash_popup_ranks_by_session_usage() {
+        let mut app = App::new(&opts());
+        app.submit_text("/history");
+        type_str(&mut app, "/");
+        let names: Vec<String> = app.completion_items().into_iter().map(|i| i.label).collect();
+        assert_eq!(names[0], "/history");
+    }
+
+    #[test]
+    fn right_accepts_history_suggestion() {
+        let mut app = App::new(&opts());
+        type_str(&mut app, "hello world");
+        app.handle_key(key(KeyCode::Enter));
+        type_str(&mut app, "hel");
+        assert_eq!(app.history_suggestion(), Some("hello world"));
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.input.text(), "hello world");
+    }
+
+    #[test]
+    fn double_esc_on_empty_input_sends_rewind() {
+        let mut app = App::new(&opts());
+        assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), vec![UiCommand::Submit("/rewind".into())]);
+    }
+
+    #[test]
+    fn rewind_picker_navigates_and_submits_scope() {
+        let mut app = App::new(&opts());
+        let cp = |id: u32| CheckpointSummary {
+            id,
+            label: format!("prompt {id}"),
+            files: 1,
+            created: "2026-10-27T10:00:00Z".into(),
+            message_index: 0,
+        };
+        app.handle_event(AppEvent::CheckpointList { items: vec![cp(1), cp(2)] });
+        assert!(app.rewind.is_some());
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.handle_key(key(KeyCode::Char('c'))), vec![UiCommand::Submit("/rewind 1 code".into())]);
+        assert!(app.rewind.is_none());
     }
 
     #[test]

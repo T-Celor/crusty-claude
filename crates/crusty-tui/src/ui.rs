@@ -9,13 +9,16 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Wrap};
 
-use crate::app::{App, COMPLETION_ROWS, Entry, Tab, ToolStatus};
+use crate::app::{App, COMPLETION_ROWS, Entry, RewindPicker, Tab, ToolStatus};
+use crate::logo;
 use crate::markdown;
 use crate::panel;
 use crate::theme;
 
 /// Side panel is hidden below this terminal width.
 const PANEL_MIN_WIDTH: u16 = 90;
+/// Welcome header with the logo needs at least this many columns.
+const WELCOME_MIN_WIDTH: u16 = 60;
 /// Input box grows to this many text lines (plus its border).
 const INPUT_MAX_LINES: u16 = 8;
 /// Lines of tool output previewed under a tool line.
@@ -26,10 +29,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     let text_lines = app.input.text().split('\n').count() as u16;
     let input_height = (text_lines.min(INPUT_MAX_LINES) + 2).max(3);
+    let head = header_lines(app, area.width);
+    let head_height = head.len() as u16;
     let [header, body, input_area, status] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(input_height), Constraint::Length(1)]).areas(area);
+        Layout::vertical([Constraint::Length(head_height), Constraint::Min(3), Constraint::Length(input_height), Constraint::Length(1)])
+            .areas(area);
 
-    frame.render_widget(Paragraph::new(header_line(app)), header);
+    frame.render_widget(Paragraph::new(head), header);
 
     let main = if app.show_panel && area.width >= PANEL_MIN_WIDTH {
         let [main, panel_area] =
@@ -54,6 +60,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 
     if let Some(req) = app.approvals.front() {
         draw_approval(frame, area, app, req);
+    } else if let Some(picker) = &app.rewind {
+        draw_rewind(frame, area, picker);
     }
 }
 
@@ -63,14 +71,50 @@ pub(crate) fn rows(lines: &[Line<'_>], width: u16) -> usize {
     lines.iter().map(|l| l.width().max(1).div_ceil(width)).sum()
 }
 
-fn header_line(app: &App) -> Line<'static> {
+/// Header rows. While the transcript is empty and the terminal is wide enough, a welcome
+/// banner with the logo; otherwise one line.
+fn header_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let ctx = app.context_pct.map_or_else(|| "–".to_string(), |p| format!("{p}%"));
-    Line::from(vec![
-        Span::styled("Crusty-Claude", theme::bold()),
+    let version = env!("CARGO_PKG_VERSION");
+    let mode = Span::styled(app.mode.to_string(), ratatui::style::Style::new().fg(theme::mode_color(app.mode)));
+    if app.entries.is_empty() && width >= WELCOME_MIN_WIDTH {
+        let mut lines = logo::logo_lines();
+        let texts = [
+            Line::styled(format!("Crusty-Claude v{version} — orchestrator {}", app.orchestrator), theme::bold()),
+            Line::from(vec![Span::raw(format!("{} │ mode: ", app.short_session())), mode, Span::raw(format!(" │ ctx {ctx}"))]),
+        ];
+        for (i, text) in texts.into_iter().enumerate() {
+            if let Some(line) = lines.get_mut(i + 1) {
+                line.spans.push(Span::raw("  "));
+                line.spans.extend(text.spans);
+            }
+        }
+        return lines;
+    }
+    vec![Line::from(vec![
+        Span::styled(format!("Crusty-Claude v{version}"), theme::bold()),
         Span::raw(format!(" │ {} │ mode: ", app.short_session())),
-        Span::styled(app.mode.to_string(), ratatui::style::Style::new().fg(theme::mode_color(app.mode))),
+        mode,
         Span::raw(format!(" │ orchestrator: {} │ ctx {ctx}", app.orchestrator)),
-    ])
+    ])]
+}
+
+/// The checkpoint picker, centred over the screen.
+fn draw_rewind(frame: &mut Frame<'_>, area: Rect, picker: &RewindPicker) {
+    let width = (area.width * 7 / 10).max(40).min(area.width);
+    let mut lines = vec![Line::styled("↑/↓ select · c code · v conversation · enter both · esc close", theme::dim())];
+    for (i, cp) in picker.items.iter().enumerate() {
+        let selected = i == picker.selected;
+        let marker = if selected { "› " } else { "  " };
+        let style = if selected { theme::selected() } else { ratatui::style::Style::new() };
+        let when: String = cp.created.chars().take(19).collect::<String>().replace('T', " ");
+        lines.push(Line::styled(format!("{marker}#{} {} · {} files · {when}", cp.id, cp.label, cp.files), style));
+    }
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect::new(area.x + (area.width - width) / 2, area.y + area.height.saturating_sub(height) / 2, width, height);
+    let block = Block::bordered().title(" Rewind — checkpoints ");
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), rect);
 }
 
 fn tabs_line(selected: Tab) -> Line<'static> {
@@ -238,18 +282,20 @@ fn draw_log(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 /// The completion popup above the input box, when typing a slash command.
 fn draw_completion(frame: &mut Frame<'_>, content: Rect, input: Rect, app: &App) {
-    let matches = app.completion_matches();
-    if matches.is_empty() || app.approvals.front().is_some() {
+    let items = app.completion_items();
+    if items.is_empty() || app.approvals.front().is_some() || app.rewind.is_some() {
         return;
     }
-    let count = matches.len().min(COMPLETION_ROWS) as u16;
+    let count = items.len().min(COMPLETION_ROWS) as u16;
     let y = input.y.saturating_sub(count).max(content.y);
     let rect = Rect::new(input.x, y, input.width.min(60), count.min(input.y.saturating_sub(y)));
-    let lines: Vec<Line<'static>> = matches
+    let lines: Vec<Line<'static>> = items
         .iter()
         .take(COMPLETION_ROWS)
-        .map(|(name, desc)| {
-            Line::from(vec![Span::styled(format!("/{name}"), theme::code()), Span::styled(format!("  {desc}"), theme::dim())])
+        .enumerate()
+        .map(|(i, item)| {
+            let label_style = if i == app.completion_sel { theme::selected() } else { theme::code() };
+            Line::from(vec![Span::styled(item.label.clone(), label_style), Span::styled(format!("  {}", item.detail), theme::dim())])
         })
         .collect();
     frame.render_widget(Clear, rect);
@@ -260,11 +306,16 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::bordered().title(" prompt ");
     let inner = block.inner(area);
     let text = app.input.text();
-    let lines: Vec<Line<'static>> = if text.is_empty() {
+    let mut lines: Vec<Line<'static>> = if text.is_empty() {
         vec![Line::styled("Type a message or /command", theme::dim())]
     } else {
         text.split('\n').map(|l| Line::raw(l.to_string())).collect()
     };
+    if let Some(rest) = app.history_suggestion().and_then(|full| full.strip_prefix(text))
+        && let Some(last) = lines.last_mut()
+    {
+        last.spans.push(Span::styled(rest.to_string(), theme::dim()));
+    }
     let (row, col) = app.input.cursor_row_col();
     let scroll = row.saturating_sub(usize::from(inner.height.saturating_sub(1)));
     let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
@@ -375,7 +426,7 @@ mod tests {
     fn wide_screen_shows_panel_and_header() {
         let mut app = app();
         app.on_tick();
-        let text = screen(&app, 120, 40);
+        let text = screen(&app, 120, 60);
         for needle in ["Optimizer", "RTK", "Headroom", "pxpipe", "Ponytail", "Agents", "mode: plan"] {
             assert!(text.contains(needle), "missing {needle}");
         }
@@ -403,9 +454,48 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         let text = screen(&app, 100, 30);
         assert!(text.contains("/help"));
+        // Enter first accepts the highlighted popup row, the next Enter submits it.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input.text(), "/help ");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let text = screen(&app, 100, 30);
-        assert!(text.contains("❯ /"));
+        assert!(text.contains("❯ /help"));
+    }
+
+    #[test]
+    fn welcome_header_shows_logo_and_version() {
+        let app = app();
+        let text = screen(&app, 100, 30);
+        assert!(text.contains("Crusty-Claude v"));
+        assert!(text.contains("orchestrator anthropic:claude-opus-5-5"));
+    }
+
+    #[test]
+    fn panel_renders_new_blocks() {
+        let mut app = app();
+        app.on_tick();
+        let text = screen(&app, 140, 60);
+        for needle in ["Advisor", "Sandbox", "DLP", "Checkpoints", "not reported", "nothing masked"] {
+            assert!(text.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn auto_mode_badge_and_cycle() {
+        let mut app = app();
+        app.mode = PermissionMode::Auto;
+        assert!(screen(&app, 100, 30).contains("mode: auto"));
+        assert_eq!(PermissionMode::AcceptEdits.next(), PermissionMode::Auto);
+    }
+
+    #[test]
+    fn completion_popup_shows_file_rows() {
+        let mut app = app();
+        app.set_file_index(vec!["src/lib.rs".into()]);
+        for c in "@lib".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(screen(&app, 100, 30).contains("src/lib.rs"));
     }
 
     #[test]

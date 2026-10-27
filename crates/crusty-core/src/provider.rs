@@ -14,8 +14,21 @@ pub enum ProviderKind {
     Anthropic,
     /// OpenAI Chat Completions and compatible servers (OpenRouter, Ollama, Gemini, vLLM, ...).
     Openai,
+    /// Claude on Amazon Bedrock (Messages API through `invoke-with-response-stream`,
+    /// SigV4 or Bedrock API key). Model ids look like `us.anthropic.claude-opus-5-5-v1:0`.
+    Bedrock,
+    /// Claude on Google Cloud Vertex AI (`streamRawPredict`, OAuth from ADC or a service
+    /// account).
+    Vertex,
     /// Scripted offline provider for tests and demos.
     Mock,
+}
+
+impl ProviderKind {
+    /// Speaks the Anthropic Messages body (Anthropic, Bedrock, Vertex).
+    pub fn is_anthropic_family(self) -> bool {
+        matches!(self, ProviderKind::Anthropic | ProviderKind::Bedrock | ProviderKind::Vertex)
+    }
 }
 
 /// `provider:model`, as written in configs and on the command line.

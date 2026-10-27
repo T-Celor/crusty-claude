@@ -17,7 +17,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -29,6 +29,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Graph without tree-sitter
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check -p crusty-graph --no-default-features
       - name: Release build
         if: matrix.os == 'ubuntu-latest'
         run: cargo build --release -p crusty-cli

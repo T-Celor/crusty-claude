@@ -13,19 +13,24 @@ use crusty_agent::{
 use crusty_core::config::{Config, OptimizerMode};
 use crusty_core::permission::FixedApprover;
 use crusty_core::{
-    AppEvent, ApprovalDecision, Approver, CancellationToken, EventSink, Message, ModelRef, OriginalStore, PermissionMode, Provider, Tool,
-    UiCommand,
+    AppEvent, ApprovalDecision, Approver, CancellationToken, Checkpointer, EventSink, Message, ModelRef, NoCheckpoints, OriginalStore,
+    PermissionMode, Provider, SecretVault, Tool, UiCommand,
 };
 use crusty_graph::{CodeGraph, GraphTool};
+use crusty_laya::{LayaAdvisor, build_advisor, spawn_health_monitor};
 use crusty_mcp::McpManager;
 use crusty_pipeline::Pipeline;
 use crusty_providers::{ProviderRegistry, http_client};
+use crusty_session::checkpoint::{FileCheckpointer, prune_sessions};
 use crusty_session::commands::CustomCommand;
 use crusty_session::hooks::ShellHooks;
+use crusty_session::plugins::Plugin;
+use crusty_session::skills::SkillTool;
 use crusty_session::transcript::{self, Transcript};
 use crusty_tools::{FileToolsState, PermissionEngine, file_tools};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
+use crate::extensions::{discover_skills, merge_plugin_agents, merge_plugin_mcp, plugin_commands, plugin_hooks, plugin_line};
 use crate::{Cli, ModeArg};
 
 /// Configuration with the command-line overrides applied.
@@ -39,6 +44,8 @@ pub struct Loaded {
     pub hidden_tools: Vec<String>,
     /// The user trusts this project's own configuration.
     pub trusted: bool,
+    /// Enabled plugins; their hooks and MCP servers are already merged into `config`.
+    pub plugins: Vec<Plugin>,
 }
 
 pub fn init_logging(cli: &Cli) -> Option<tracing_appender::non_blocking::WorkerGuard> {
@@ -71,7 +78,19 @@ pub fn load_config(cli: &Cli) -> Result<Loaded> {
         config.mcp.read_mcp_json = Some(false);
         warnings.push("this project's .mcp.json is ignored until you trust the project (`crusty trust`)".into());
     }
-    let defs = crusty_session::agents::load_agent_files(&workspace, &home, trusted);
+    let plugins = if config.plugins.enabled {
+        let (plugins, plugin_warnings) = crusty_session::plugins::load_plugins(&workspace, &home, trusted, &config.plugins.disabled);
+        warnings.extend(plugin_warnings);
+        plugins
+    } else {
+        Vec::new()
+    };
+    for (name, hooks) in plugin_hooks(&plugins, &mut warnings) {
+        config.hooks.entry(name).or_default().extend(hooks);
+    }
+    merge_plugin_mcp(&mut config.mcp.servers, &plugins, &mut warnings);
+    let mut defs = crusty_session::agents::load_agent_files(&workspace, &home, trusted);
+    merge_plugin_agents(&mut defs, &plugins);
     warnings.extend(crusty_session::agents::merge_into_config(&mut config, &defs));
 
     if let Some(m) = &cli.model {
@@ -116,7 +135,7 @@ pub fn load_config(cli: &Cli) -> Result<Loaded> {
         };
     }
     warnings.extend(config.validate()?);
-    Ok(Loaded { config, workspace, home, warnings, sources: report.sources, hidden_tools, trusted })
+    Ok(Loaded { config, workspace, home, warnings, sources: report.sources, hidden_tools, trusted, plugins })
 }
 
 /// A ready session and what must be cleaned up after it.
@@ -169,7 +188,7 @@ fn resolve_session(cli: &Cli, dir: &std::path::Path) -> Result<StartPoint> {
 }
 
 pub async fn build_session(cli: &Cli, loaded: Loaded, interactive: bool) -> Result<Session> {
-    let Loaded { config, workspace, home, mut warnings, hidden_tools, .. } = loaded;
+    let Loaded { config, workspace, home, mut warnings, hidden_tools, plugins, trusted, .. } = loaded;
     let config = Arc::new(config);
     let (tx, events_rx) = mpsc::unbounded_channel();
     let events = EventSink::new(tx);
@@ -178,11 +197,22 @@ pub async fn build_session(cli: &Cli, loaded: Loaded, interactive: bool) -> Resu
     let providers: BTreeMap<String, Arc<dyn Provider>> =
         registry.ids().into_iter().filter_map(|id| registry.get(id).map(|p| (id.to_owned(), p))).collect();
     let store = Arc::new(OriginalStore::default());
-    let pipeline = Arc::new(Pipeline::new(&config, events.clone(), store.clone()));
+    let vault = Arc::new(SecretVault::default());
+    let background = CancellationToken::new();
+    let native = Arc::new(crusty_advisor::NativeAdvisor::new(&config.laya));
+    let advisor: Arc<dyn crusty_core::Advisor> = if config.laya.enabled {
+        // The concrete type is needed for the health monitor; `build_advisor` does the same wrapping.
+        let laya = Arc::new(LayaAdvisor::new(&config.laya, native, http_client(10), events.clone()));
+        spawn_health_monitor(laya.clone(), background.clone());
+        laya
+    } else {
+        build_advisor(&config.laya, native, http_client(10), events.clone())
+    };
+    let pipeline = Arc::new(Pipeline::new(&config, events.clone(), store.clone()).with_advisor(advisor.clone()).with_vault(vault.clone()));
     pipeline.set_counters(providers.clone());
 
     let mut tools: Vec<Arc<dyn Tool>> = file_tools(&FileToolsState::default());
-    tools.extend(crusty_shell::shell_tools(Arc::new(crusty_shell::BackgroundShells::default())));
+    tools.extend(crusty_shell::shell_tools(Arc::new(crusty_shell::BackgroundShells::default()), crate::sandbox_exec::setup(&config)));
     tools.extend(crusty_web::web_tools());
     let graph = config.optimizer.graphify.enabled.then(|| Arc::new(CodeGraph::new(&workspace, config.optimizer.graphify.clone())));
     if let Some(g) = &graph {
@@ -213,6 +243,29 @@ pub async fn build_session(cli: &Cli, loaded: Loaded, interactive: bool) -> Resu
     let mcp = McpManager::connect_all(servers, &events, Duration::from_secs(30)).await;
     tools.extend(mcp.tools());
 
+    let (skills, skill_warnings) = discover_skills(&config, &workspace, &home, &plugins, trusted);
+    warnings.extend(skill_warnings);
+    if config.skills.enabled && !skills.is_empty() {
+        tools.push(Arc::new(SkillTool::new(skills.clone())));
+    }
+    let checkpoints: Arc<dyn Checkpointer> = if config.checkpoints.enabled {
+        let root = crusty_core::paths::crusty_home().join("projects").join(crusty_core::paths::project_key(&workspace)).join("checkpoints");
+        match FileCheckpointer::open(root.join(&session_id), workspace.clone(), &config.checkpoints) {
+            Ok(c) => {
+                if let Err(e) = prune_sessions(&root, config.checkpoints.keep_sessions) {
+                    warnings.push(format!("old checkpoints not pruned: {e}"));
+                }
+                Arc::new(c)
+            }
+            Err(e) => {
+                warnings.push(format!("checkpoints disabled: {e}"));
+                Arc::new(NoCheckpoints)
+            }
+        }
+    } else {
+        Arc::new(NoCheckpoints)
+    };
+
     let rt = Runtime::new(RuntimeParts {
         config: config.clone(),
         providers,
@@ -228,15 +281,24 @@ pub async fn build_session(cli: &Cli, loaded: Loaded, interactive: bool) -> Resu
         home: home.clone(),
         session_id: session_id.clone(),
         store,
+        advisor,
+        checkpoints,
+        vault,
     });
+    let policy = crusty_sandbox::Policy::from_config(&config.sandbox, &workspace, &workspace);
+    events.emit(AppEvent::Sandbox(crusty_sandbox::describe(&crusty_sandbox::detect(&config.sandbox), &policy)));
     rt.update_settings(|s| {
         s.hidden_tools = hidden_tools;
         s.append_system.clone_from(&cli.append_system_prompt);
         s.system_override.clone_from(&cli.system_prompt);
         s.max_turns = cli.max_turns;
+        // An explicit --model must not be overridden by the model router.
+        s.orchestrator_pinned = cli.model.is_some();
     });
     reload_memory(&rt);
     rt.update_context(|c| {
+        c.skills = skills.iter().map(|s| format!("{}: {}", s.name, s.description)).collect();
+        c.plugins = plugins.iter().map(plugin_line).collect();
         c.mcp_status = mcp
             .status()
             .iter()
@@ -254,7 +316,6 @@ pub async fn build_session(cli: &Cli, loaded: Loaded, interactive: bool) -> Resu
         Ok(t) => rt.set_transcript(Some(t)),
         Err(e) => warnings.push(format!("transcript disabled: {e}")),
     }
-    let background = CancellationToken::new();
     crusty_proxy::spawn_health_monitor(
         rt.proxy_upstreams.clone(),
         http_client(10),
@@ -262,7 +323,12 @@ pub async fn build_session(cli: &Cli, loaded: Loaded, interactive: bool) -> Resu
         Duration::from_secs(config.proxy.health_interval_secs.max(1)),
         background.clone(),
     );
-    let custom_commands = crusty_session::commands::load_commands(&workspace, &home);
+    let mut custom_commands = crusty_session::commands::load_commands(&workspace, &home);
+    for c in plugin_commands(&plugins) {
+        if !custom_commands.iter().any(|x| x.name == c.name) {
+            custom_commands.push(c);
+        }
+    }
     Ok(Session {
         rt,
         events_rx,

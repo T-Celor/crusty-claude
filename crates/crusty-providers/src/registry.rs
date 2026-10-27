@@ -9,8 +9,10 @@ use crusty_core::config::ProviderConfig;
 use crusty_core::provider::{Provider, ProviderKind};
 
 use crate::anthropic::AnthropicProvider;
+use crate::bedrock::{self, BedrockProvider};
 use crate::mock::MockProvider;
 use crate::openai::OpenAiProvider;
+use crate::vertex::{self, VertexProvider};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
@@ -50,10 +52,58 @@ pub fn build_provider(id: &str, cfg: &ProviderConfig, http: reqwest::Client) -> 
         ProviderKind::Anthropic => Arc::new(AnthropicProvider::new(id, cfg.clone(), http)),
         ProviderKind::Openai => Arc::new(OpenAiProvider::new(id, cfg.clone(), http)),
         ProviderKind::Mock => Arc::new(MockProvider::new(id)),
+        ProviderKind::Bedrock => Arc::new(BedrockProvider::new(id, cfg.clone(), http)),
+        ProviderKind::Vertex => Arc::new(VertexProvider::new(id, cfg.clone(), http)),
+    }
+}
+
+/// Whether the credentials a provider needs are configured, with a one-line description of
+/// what was found. Reads only through `env`; `gcloud` and the metadata server are not probed.
+pub fn credential_status(cfg: &ProviderConfig, env: impl Fn(&str) -> Option<String>) -> (bool, String) {
+    let found = |name: Option<&str>| name.and_then(|n| env(n).filter(|v| !v.trim().is_empty()));
+    match cfg.kind {
+        ProviderKind::Anthropic => {
+            match found(cfg.api_key_env.as_deref())
+                .map(|_| "API key")
+                .or_else(|| found(cfg.auth_token_env.as_deref()).map(|_| "bearer token"))
+            {
+                Some(what) => (true, format!("{what} found")),
+                None => (false, "no API key or auth token environment variable is set".to_owned()),
+            }
+        }
+        ProviderKind::Openai => match found(cfg.api_key_env.as_deref()) {
+            Some(_) => (true, "API key found".to_owned()),
+            None => (false, "no API key set (keyless servers need none)".to_owned()),
+        },
+        ProviderKind::Bedrock => {
+            if bedrock::bearer_token(cfg, &env).is_some() {
+                (true, "bearer key found".to_owned())
+            } else if bedrock::load_credentials(cfg, &env).is_some() {
+                (true, "AWS credentials found (SigV4)".to_owned())
+            } else {
+                (false, "no AWS_BEARER_TOKEN_BEDROCK, AWS access keys or credentials profile".to_owned())
+            }
+        }
+        ProviderKind::Vertex => {
+            let adc = found(Some("GOOGLE_APPLICATION_CREDENTIALS"))
+                .map(std::path::PathBuf::from)
+                .or_else(|| dirs::config_dir().map(|dir| dir.join("gcloud").join("application_default_credentials.json")));
+            if vertex::project(cfg, &env).is_none() {
+                (false, "no project: set project_id, ANTHROPIC_VERTEX_PROJECT_ID or GOOGLE_CLOUD_PROJECT".to_owned())
+            } else if found(Some("GOOGLE_OAUTH_ACCESS_TOKEN")).is_some() {
+                (true, "OAuth token from GOOGLE_OAUTH_ACCESS_TOKEN".to_owned())
+            } else if adc.is_some_and(|path| path.exists()) {
+                (true, "application default credentials found; token fetched per process".to_owned())
+            } else {
+                (false, "no OAuth token or application default credentials".to_owned())
+            }
+        }
+        ProviderKind::Mock => (true, "no credentials needed".to_owned()),
     }
 }
 
 /// Providers of a configuration, keyed by their `[providers.<name>]` id.
+
 #[derive(Default)]
 pub struct ProviderRegistry {
     providers: BTreeMap<String, Arc<dyn Provider>>,

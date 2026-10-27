@@ -1,14 +1,17 @@
 //! Session-wide services shared by the orchestrator and every executor.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crusty_core::advisor::Advisor;
+use crusty_core::checkpoint::Checkpointer;
 use crusty_core::config::{ModelOverride, ModelProfile, PonytailConfig, ProxyUpstream, ResolvedDomain};
 use crusty_core::event::TodoItem;
 use crusty_core::filter::ContentFilter;
 use crusty_core::hooks::HookRunner;
+use crusty_core::vault::SecretVault;
 use crusty_core::{
     Approver, CancellationToken, Config, EventSink, OriginalStore, PermissionPolicy, Provider, RequestOptimizer, Tool, ToolContext,
 };
@@ -41,6 +44,10 @@ pub struct RuntimeSettings {
     pub system_override: Option<String>,
     /// Max model calls of the orchestrator per turn (`--max-turns`), else config.
     pub max_turns: Option<u32>,
+    /// The user chose the orchestrator model (`--model`, `/model`): the router leaves it alone.
+    pub orchestrator_pinned: bool,
+    /// Tier the router picked for this session, shown by `/model` and the side panel.
+    pub routed_tier: Option<String>,
 }
 
 /// Prompt material gathered at session start.
@@ -50,6 +57,10 @@ pub struct SessionContext {
     pub memory_files: Vec<PathBuf>,
     pub repo_map: Option<String>,
     pub mcp_status: Vec<String>,
+    /// `name: description` of every skill offered to the agents (`/skills`).
+    pub skills: Vec<String>,
+    /// `name version (source)` of every loaded plugin (`/plugins`).
+    pub plugins: Vec<String>,
 }
 
 /// Everything an agent run needs. Built once per session by the binary.
@@ -64,6 +75,12 @@ pub struct Runtime {
     pub filters: Arc<dyn ContentFilter>,
     pub events: EventSink,
     pub store: Arc<OriginalStore>,
+    pub advisor: Arc<dyn Advisor>,
+    pub checkpoints: Arc<dyn Checkpointer>,
+    /// Placeholders of values masked by the DLP stage, restored in tool inputs and shown text.
+    pub vault: Arc<SecretVault>,
+    /// What each agent works on (its prompt or task), given to tools as `ToolContext::goal`.
+    pub goals: Mutex<BTreeMap<String, Arc<str>>>,
     pub policy: PolicyBundle,
     /// Canonical project root.
     pub workspace: PathBuf,
@@ -75,8 +92,14 @@ pub struct Runtime {
     pub transcript: Mutex<Option<Transcript>>,
     /// Shared with the proxy health monitor.
     pub proxy_upstreams: Arc<RwLock<Vec<ProxyUpstream>>>,
+    /// MCP servers whose tools are hidden from the model until `ToolSearch` loads them
+    /// (intent detection found them irrelevant to the prompt).
+    pub deferred_servers: RwLock<BTreeSet<String>>,
     /// Latest plan per agent, from TodoWrite calls.
     pub plans: Mutex<BTreeMap<String, Vec<TodoItem>>>,
+    /// Highest checkpoint id that existed at the latest compaction (0 when none): checkpoints up
+    /// to it cannot rewind the conversation any more.
+    compacted_through_checkpoint: AtomicU32,
     /// Reviewer delegations in the current user turn.
     pub review_count: AtomicU32,
     /// Parallel executors per delegation depth (one pool per depth, so nested delegation cannot
@@ -103,6 +126,10 @@ pub struct RuntimeParts {
     pub session_id: String,
     /// Shared with the optimizer so `Retrieve` finds what Headroom and RTK shortened.
     pub store: Arc<OriginalStore>,
+    pub advisor: Arc<dyn Advisor>,
+    pub checkpoints: Arc<dyn Checkpointer>,
+    /// Shared with the DLP stage of the optimizer.
+    pub vault: Arc<SecretVault>,
 }
 
 fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -137,6 +164,8 @@ impl Runtime {
             append_system: None,
             system_override: None,
             max_turns: None,
+            orchestrator_pinned: false,
+            routed_tier: None,
         };
         let slots = config.orchestrator.max_parallel_agents.max(1);
         Arc::new(Runtime {
@@ -149,6 +178,10 @@ impl Runtime {
             filters: parts.filters,
             events: parts.events,
             store: parts.store,
+            advisor: parts.advisor,
+            checkpoints: parts.checkpoints,
+            vault: parts.vault,
+            goals: Mutex::new(BTreeMap::new()),
             policy: parts.policy,
             workspace,
             allowed_roots,
@@ -158,13 +191,38 @@ impl Runtime {
             context: RwLock::new(SessionContext::default()),
             transcript: Mutex::new(None),
             proxy_upstreams: Arc::new(RwLock::new(config.proxy.upstreams.clone())),
+            deferred_servers: RwLock::new(BTreeSet::new()),
             plans: Mutex::new(BTreeMap::new()),
+            compacted_through_checkpoint: AtomicU32::new(0),
             review_count: AtomicU32::new(0),
             agent_slots: Mutex::new(BTreeMap::new()),
             max_slots: slots,
             next_agent: AtomicU32::new(1),
             config,
         })
+    }
+
+    /// MCP servers currently deferred (their tools are not sent to the model).
+    pub fn deferred_servers(&self) -> BTreeSet<String> {
+        read(&self.deferred_servers).clone()
+    }
+
+    /// Replaces the deferred MCP servers (intent detection, once per prompt).
+    pub fn set_deferred_servers(&self, servers: BTreeSet<String>) {
+        *write(&self.deferred_servers) = servers;
+    }
+
+    /// Loads a deferred server's tools (`ToolSearch`). False when it was not deferred.
+    pub fn load_deferred(&self, server: &str) -> bool {
+        write(&self.deferred_servers).remove(server)
+    }
+
+    /// Whether a tool belongs to a deferred MCP server (`mcp__<server>__<tool>`).
+    pub fn is_deferred_tool(&self, tool: &str) -> bool {
+        let Some(rest) = tool.strip_prefix("mcp__") else {
+            return false;
+        };
+        read(&self.deferred_servers).iter().any(|s| rest.strip_prefix(s.as_str()).is_some_and(|t| t.starts_with("__")))
     }
 
     pub fn session_id(&self) -> String {
@@ -212,6 +270,25 @@ impl Runtime {
 
     pub fn plan(&self, agent_id: &str) -> Option<Vec<TodoItem>> {
         lock(&self.plans).get(agent_id).cloned()
+    }
+
+    /// Records the newest checkpoint id at a compaction of the conversation.
+    pub fn mark_compaction(&self, newest_checkpoint: u32) {
+        self.compacted_through_checkpoint.store(newest_checkpoint, Ordering::Relaxed);
+    }
+
+    /// Checkpoints up to this id were taken before the latest compaction.
+    pub fn compacted_through_checkpoint(&self) -> u32 {
+        self.compacted_through_checkpoint.load(Ordering::Relaxed)
+    }
+
+    /// Drops what the optimizer and the deferred MCP set keep about the conversations `ids`
+    /// (`/clear`, `/resume`, `/rewind`).
+    pub fn forget_conversation(&self, ids: &[&str]) {
+        self.set_deferred_servers(BTreeSet::new());
+        for id in ids {
+            self.optimizer.forget_session(id);
+        }
     }
 
     /// `domain-<n>` ids, unique in the session.
@@ -270,7 +347,19 @@ impl Runtime {
             store: self.store.clone(),
             config: self.config.clone(),
             filters: self.filters.clone(),
+            advisor: self.advisor.clone(),
+            checkpoints: self.checkpoints.clone(),
+            goal: self.goal(agent_id),
         }
+    }
+
+    /// Records what `agent_id` works on.
+    pub fn set_goal(&self, agent_id: &str, goal: &str) {
+        lock(&self.goals).insert(agent_id.to_owned(), Arc::from(goal));
+    }
+
+    pub fn goal(&self, agent_id: &str) -> Arc<str> {
+        lock(&self.goals).get(agent_id).cloned().unwrap_or_else(|| Arc::from(""))
     }
 
     /// Ponytail text for the current level, `None` when disabled.

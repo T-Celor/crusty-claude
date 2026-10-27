@@ -45,15 +45,21 @@ pub enum PermissionMode {
     /// asked), and deny rules and the workspace sandbox still apply: this mode never
     /// disables protections.
     BypassPermissions,
+    /// Like `default`, but a request that would be asked runs without asking when the
+    /// advisor (Laya, or the native scorer) is confident enough that it is safe. Critical
+    /// risk is always asked; deny rules and the sandbox still apply.
+    Auto,
 }
 
 impl PermissionMode {
+    /// Shift+Tab cycle. `bypassPermissions` is left out on purpose: it is reached only by
+    /// an explicit `/permissions mode` or the command line.
     pub fn next(self) -> Self {
         match self {
             PermissionMode::Default => PermissionMode::AcceptEdits,
-            PermissionMode::AcceptEdits => PermissionMode::Plan,
-            PermissionMode::Plan => PermissionMode::BypassPermissions,
-            PermissionMode::BypassPermissions => PermissionMode::Default,
+            PermissionMode::AcceptEdits => PermissionMode::Auto,
+            PermissionMode::Auto => PermissionMode::Plan,
+            PermissionMode::Plan | PermissionMode::BypassPermissions => PermissionMode::Default,
         }
     }
 
@@ -63,6 +69,7 @@ impl PermissionMode {
             "acceptedits" => Some(PermissionMode::AcceptEdits),
             "plan" => Some(PermissionMode::Plan),
             "bypasspermissions" | "bypass" => Some(PermissionMode::BypassPermissions),
+            "auto" => Some(PermissionMode::Auto),
             _ => None,
         }
     }
@@ -75,6 +82,7 @@ impl std::fmt::Display for PermissionMode {
             PermissionMode::AcceptEdits => "acceptEdits",
             PermissionMode::Plan => "plan",
             PermissionMode::BypassPermissions => "bypassPermissions",
+            PermissionMode::Auto => "auto",
         })
     }
 }
@@ -173,10 +181,15 @@ mod tests {
     #[test]
     fn mode_cycles_and_parses() {
         let mut m = PermissionMode::Default;
+        let mut seen = Vec::new();
         for _ in 0..4 {
             m = m.next();
+            seen.push(m);
         }
         assert_eq!(m, PermissionMode::Default);
+        assert!(!seen.contains(&PermissionMode::BypassPermissions), "Shift+Tab never enters bypass");
+        assert_eq!(PermissionMode::BypassPermissions.next(), PermissionMode::Default);
+        assert_eq!(PermissionMode::parse("auto"), Some(PermissionMode::Auto));
         assert_eq!(PermissionMode::parse("accept-edits"), Some(PermissionMode::AcceptEdits));
         assert_eq!(PermissionMode::parse("bypassPermissions"), Some(PermissionMode::BypassPermissions));
         assert_eq!(PermissionMode::parse("nope"), None);

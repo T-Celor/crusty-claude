@@ -83,6 +83,8 @@ pub async fn compact(
     let _ = write!(prompt, "\n<conversation>\n{}</conversation>", render(&messages[..split]));
     let mut req = ChatRequest::new(&spec.profile.model, 8_000);
     req.messages.push(Message::user_text(prompt));
+    // Nothing leaves the process unmasked; the summary keeps the placeholders. A no-op when DLP is off.
+    crusty_dlp::redact_request(&mut req, &rt.vault, rt.advisor.as_ref(), &rt.config.laya.dlp).await;
     let opts =
         CallOptions { base_url_override: rt.provider_route(&spec.profile.provider), cancel: cancel.clone(), extra_headers: Vec::new() };
     let resp = provider.stream(&req, &opts, &|_| {}).await.map_err(|e| e.to_string())?;
@@ -99,12 +101,15 @@ pub async fn compact(
         cost_usd,
     });
     let mut tail = messages.split_off(split);
+    let kept = tail.len();
     let header = ContentBlock::text(format!("[Conversation summary — earlier messages were compacted]\n{summary}"));
     // The tail starts with a user message: the summary joins it, so roles keep alternating.
     tail[0].content.insert(0, header);
     *messages = tail;
     if spec.depth == 0 {
-        rt.log(&Entry::Compaction { summary: summary.clone(), replaced: split, ts: chrono::Utc::now() });
+        rt.log(&Entry::Compaction { summary: summary.clone(), replaced: split, kept, ts: chrono::Utc::now() });
+        // `/rewind <id> conversation` to a checkpoint from before this point would cut the wrong messages.
+        rt.mark_compaction(rt.checkpoints.list().iter().map(|c| c.id).max().unwrap_or(0));
     }
     Ok(CompactReport { replaced: split, summary_chars: summary.len(), usage: resp.usage, cost_usd })
 }

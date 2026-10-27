@@ -19,7 +19,7 @@ max_parallel_agents = 3          # executors running at once
 max_review_loops = 2             # reviewer delegations per prompt, beyond the first
 max_depth = 1                    # executors cannot delegate further
 # Tools the orchestrator may call itself; everything else goes through executors.
-direct_tools = ["Read", "Glob", "Grep", "LS", "Graph", "Retrieve", "WebSearch", "WebFetch", "TodoWrite", "Task"]
+direct_tools = ["Read", "Glob", "Grep", "LS", "Graph", "Retrieve", "WebSearch", "WebFetch", "TodoWrite", "Skill", "ToolSearch", "Task"]
 # fallback = ["anthropic:claude-sonnet-5-5"]   # tried when the model is unavailable
 # token_budget = 2000000                       # hard cap (real usage) per prompt
 # cost_budget_usd = 5.0
@@ -136,7 +136,7 @@ enabled = true
 mode = "active"                  # active | observe (measure only)
 preserve_original = true         # originals retrievable with the Retrieve tool
 minimum_estimated_gain = 0.05
-measure_with_count_tokens = false   # real "before" counts via Anthropic count_tokens
+measure_with_count_tokens = true    # real "before" counts (count_tokens on Anthropic/Bedrock/Vertex, tiktoken for OpenAI)
 
 [optimizer.rtk]
 enabled = true
@@ -234,3 +234,84 @@ memory_files = ["CRUSTY.md", "CLAUDE.md"]
 # args = ["-y", "@modelcontextprotocol/server-github"]
 # [mcp.servers.docs]
 # url = "https://example.com/mcp"
+
+# ── Sandbox OS des commandes Bash (crusty-sandbox) ───────────────────────────
+# Linux: bubblewrap, else Landlock. macOS: Seatbelt. Windows: Job Object only
+# (kills the process tree; NO filesystem or network isolation).
+[sandbox]
+mode = "workspace-write"         # off | read-only | workspace-write
+network = true
+writable_roots = []
+fail_if_unavailable = false      # true: refuse to run a command when no sandbox works
+allow_unsandboxed_requests = true  # model may ask dangerouslyDisableSandbox; always asked
+
+# ── Laya (laya-serve, optional; native fallback when absent) ─────────────────
+# Laya can only make security decisions stricter (except `auto` mode, risk <= moderate).
+# laya.url must be https or loopback http.
+[laya]
+enabled = true
+url = "http://127.0.0.1:8000"
+api_key_env = "LAYA_API_KEY"
+timeout_ms = 1500
+health_interval_secs = 30
+min_confidence = 0.6             # below: unsure, the native fallback decides
+
+[laya.guard]                     # allow/review/block on Bash commands and sensitive writes
+commands = true
+files = true
+# sensitive_paths = ["**/.env", "**/.github/workflows/**", "**/Dockerfile"]  # defaults are longer
+
+[laya.dlp]                       # outbound masking: secrets and PII become ⟦SECRET_n⟧
+enabled = true
+secrets = true
+pii = true
+ambiguous_threshold = 0.5
+rehydrate = true                 # restore masked values in tool inputs
+allow_values = []
+
+[laya.rerank]
+enabled = true
+min_items = 30
+keep = 20
+
+[laya.pruner]                    # stale tool results, batched (cache-stable), retrievable
+enabled = true
+keep_recent_messages = 12
+min_relevance = 0.15
+batch_messages = 8
+
+[laya.triage]                    # failed build/test logs
+enabled = true
+min_lines = 60
+max_blocks = 8
+context_lines = 3
+
+[laya.router]                    # trivial/routine/hard/research -> Haiku/Sonnet/Opus
+enabled = true                   # --model or /model pins the model; /model auto re-enables
+every_prompt = false
+min_confidence = 0.475
+
+[laya.intent]                    # defer irrelevant MCP tools behind ToolSearch
+enabled = true
+defer_mcp_tools = true
+min_relevance = 0.3
+always_load = []
+
+[laya.auto_mode]                 # `auto` permission mode
+threshold = 0.8
+
+# ── Checkpoints and /rewind ──────────────────────────────────────────────────
+# Tracks edits made by the file tools (not shell-command changes, not .git).
+[checkpoints]
+enabled = true
+max_file_bytes = 5242880
+keep_sessions = 20
+
+# ── Skills (SKILL.md) and plugins (plugin.json) ──────────────────────────────
+[skills]
+enabled = true
+disabled = []
+
+[plugins]                        # project plugins load only after `crusty trust`
+enabled = true
+disabled = []

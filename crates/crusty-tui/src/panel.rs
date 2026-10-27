@@ -1,7 +1,7 @@
 //! Side panel: live optimizer stages, agents and plan. Every number comes from the metrics
 //! snapshot taken on the last tick, or from configuration. Estimates are labelled "est.".
 
-use crusty_core::event::{AgentStatus, Stage, TodoStatus};
+use crusty_core::event::{AdvicePoint, AgentStatus, Stage, TodoStatus};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -44,20 +44,88 @@ pub fn fmt_ratio(ratio: f64) -> String {
 
 /// Draws the side panel into `area`.
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let optimizer = optimizer_lines(app);
-    let agents = agent_lines(app);
-    let plan = plan_lines(app);
+    let sections: Vec<(&'static str, Vec<Line<'static>>)> = vec![
+        (" Optimizer (live) ", optimizer_lines(app)),
+        (" Agents ", agent_lines(app)),
+        (" Plan ", plan_lines(app)),
+        (" Advisor ", advisor_lines(app)),
+        (" Sandbox ", sandbox_lines(app)),
+        (" DLP ", dlp_lines(app)),
+        (" Checkpoints ", checkpoint_lines(app)),
+    ];
     let width = area.width.saturating_sub(2) as usize;
-    let [opt_a, agents_a, plan_a, _] = Layout::vertical([
-        Constraint::Length(height(&optimizer, width)),
-        Constraint::Length(height(&agents, width)),
-        Constraint::Length(height(&plan, width)),
-        Constraint::Min(0),
-    ])
-    .areas(area);
-    block(frame, opt_a, " Optimizer (live) ", optimizer);
-    block(frame, agents_a, " Agents ", agents);
-    block(frame, plan_a, " Plan ", plan);
+    let constraints: Vec<Constraint> =
+        sections.iter().map(|(_, lines)| Constraint::Length(height(lines, width))).chain(std::iter::once(Constraint::Min(0))).collect();
+    let areas = Layout::vertical(constraints).split(area);
+    for ((title, lines), part) in sections.into_iter().zip(areas.iter()) {
+        block(frame, *part, title, lines);
+    }
+}
+
+/// Lines of the "Advisor" block: Laya health, then per-point answers.
+fn advisor_lines(app: &App) -> Vec<Line<'static>> {
+    let adv = &app.snapshot.advisor;
+    let mut out = Vec::new();
+    if adv.url.is_empty() {
+        out.push(Line::styled("  Laya: native", theme::dim()));
+    } else if adv.up {
+        let latency = adv.latency_ms.map_or(String::new(), |ms| format!(" {ms}ms"));
+        out.push(Line::from(vec![Span::raw("  Laya: "), Span::styled("● up", theme::OK), Span::raw(latency)]));
+    } else {
+        out.push(Line::from(vec![Span::raw("  Laya: "), Span::styled("✕ down", theme::ERR)]));
+    }
+    for point in AdvicePoint::ALL {
+        if let Some(t) = adv.points.get(&point) {
+            out.push(Line::raw(format!(
+                "  {:<9} laya {} · native {} · abstain {} · review/block {}",
+                point.label(),
+                t.laya,
+                t.native,
+                t.abstained,
+                t.escalations
+            )));
+        }
+    }
+    if out.len() == 1 {
+        out.push(Line::styled("  (no advice yet)", theme::dim()));
+    }
+    if let Some(reason) = &adv.last_fallback_reason {
+        out.push(Line::styled(format!("  last fallback: {reason}"), theme::warn()));
+    }
+    out
+}
+
+/// Lines of the "Sandbox" block: backend, mode and network, or a warning when unsandboxed.
+fn sandbox_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(info) = &app.snapshot.sandbox else {
+        return vec![Line::styled("  (not reported)", theme::dim())];
+    };
+    let mut out = Vec::new();
+    if info.backend == "none" || info.mode == "off" {
+        out.push(Line::styled("⚠ unsandboxed", theme::ERR));
+    } else {
+        let network = if info.network_blocked { "off" } else { "on" };
+        out.push(Line::raw(format!("  {} · {} · network {network}", info.backend, info.mode)));
+    }
+    if !info.available {
+        out.push(Line::styled(format!("  backend unavailable: {}", info.detail), theme::warn()));
+    }
+    out
+}
+
+/// Lines of the "DLP" block: values masked in this session.
+fn dlp_lines(app: &App) -> Vec<Line<'static>> {
+    let snap = &app.snapshot;
+    if snap.redacted_secrets == 0 && snap.redacted_pii == 0 {
+        return vec![Line::styled("  nothing masked yet", theme::dim())];
+    }
+    vec![Line::raw(format!("  secrets masked {} · PII masked {}", snap.redacted_secrets, snap.redacted_pii))]
+}
+
+/// Lines of the "Checkpoints" block: count, rewinds and the newest id.
+fn checkpoint_lines(app: &App) -> Vec<Line<'static>> {
+    let last = app.last_checkpoint.map_or_else(|| "–".to_string(), |id| format!("#{id}"));
+    vec![Line::raw(format!("  {} saved · {} rewinds · last {last}", app.snapshot.checkpoints, app.snapshot.rewinds))]
 }
 
 fn block(frame: &mut Frame<'_>, area: Rect, title: &'static str, lines: Vec<Line<'static>>) {
@@ -83,6 +151,10 @@ fn stage_enabled(app: &App, stage: Stage) -> bool {
         Stage::ContextGate => opt.enabled && opt.context_gate.enabled,
         Stage::Pxpipe => opt.enabled && opt.pxpipe.enabled,
         Stage::Proxy => cfg.proxy.upstreams.iter().any(|u| u.enabled),
+        Stage::Triage => opt.enabled && cfg.laya.triage.enabled,
+        Stage::Rerank => opt.enabled && cfg.laya.rerank.enabled,
+        Stage::Prune => opt.enabled && cfg.laya.pruner.enabled,
+        Stage::Dlp => cfg.laya.dlp.enabled,
     }
 }
 
@@ -107,11 +179,12 @@ fn optimizer_lines(app: &App) -> Vec<Line<'static>> {
             Span::raw(format!("{:<10}", stage.label())),
             Span::raw(format!(" runs {:>4}", t.runs)),
         ];
-        if t.tokens_before_est > 0 {
+        if t.real_samples > 0 {
+            let saved_real = t.tokens_before_real as i64 - t.tokens_after_real as i64;
+            let ratio = t.ratio_real().map_or_else(String::new, |r| format!(" {}", fmt_ratio(r)));
+            spans.push(Span::styled(format!(" measured {}{ratio}", fmt_saved(saved_real)), theme::OK));
+        } else if t.tokens_before_est > 0 {
             spans.push(Span::raw(format!(" saved {} ({} est.)", fmt_saved(t.saved_est()), fmt_ratio(t.ratio_est()))));
-        }
-        if let Some(real) = t.ratio_real() {
-            spans.push(Span::raw(format!(" real {}", fmt_ratio(real))));
         }
         out.push(Line::from(spans));
     }
@@ -156,6 +229,9 @@ fn optimizer_lines(app: &App) -> Vec<Line<'static>> {
 
     let total = &snap.total_usage;
     out.push(Line::raw(format!("  saved ≈ {} tok (est.)", fmt_saved(snap.total_saved_est()))));
+    if let Some(real) = snap.total_saved_real() {
+        out.push(Line::styled(format!("  measured ≈ {} tok (real counts)", fmt_saved(real)), theme::OK));
+    }
     if cfg.tui.show_token_metrics {
         out.push(Line::raw(format!(
             "  real in {} · out {} · cache {}",

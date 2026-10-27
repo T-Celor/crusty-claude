@@ -11,10 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crusty_core::config::{Config, OptimizerConfig, OptimizerMode};
+use crusty_core::advisor::{Advisor, NoAdvisor};
+use crusty_core::config::{Config, LayaConfig, OptimizerConfig, OptimizerMode};
 use crusty_core::event::{AppEvent, Stage, StageMetrics, StageStatus};
 use crusty_core::filter::{ContentFilter, Filtered, HtmlDoc};
 use crusty_core::tokens::estimate_request;
+use crusty_core::tool::ToolOutput;
+use crusty_core::vault::SecretVault;
 use crusty_core::{
     ChatRequest, EventSink, OptimizeContext, OptimizeOutcome, OriginalStore, Provider, ProviderKind, RequestOptimizer, Route, Usage,
     async_trait,
@@ -22,8 +25,21 @@ use crusty_core::{
 use crusty_gate::{ContextGate, DryRun, GateInput, GateRoute, PreDecision, PxpipeRenderer, PxpipeResult};
 use crusty_optimizer::{Headroom, convert_html, filter_command};
 
+use crusty_dlp::redact_request;
+use prune::PruneSessions;
+
 /// Stages this pipeline can switch at runtime.
-const SWITCHABLE: [Stage; 5] = [Stage::Rtk, Stage::HtmlToMarkdown, Stage::Headroom, Stage::ContextGate, Stage::Pxpipe];
+const SWITCHABLE: [Stage; 9] = [
+    Stage::Rtk,
+    Stage::HtmlToMarkdown,
+    Stage::Triage,
+    Stage::Rerank,
+    Stage::Dlp,
+    Stage::Prune,
+    Stage::Headroom,
+    Stage::ContextGate,
+    Stage::Pxpipe,
+];
 
 pub struct Pipeline {
     cfg: OptimizerConfig,
@@ -36,6 +52,13 @@ pub struct Pipeline {
     store: Arc<OriginalStore>,
     /// Providers used for `count_tokens` measurements.
     counters: RwLock<BTreeMap<String, Arc<dyn Provider>>>,
+    /// Laya settings of the DLP, prune, triage and rerank stages.
+    laya: LayaConfig,
+    /// Judges ambiguous secrets, relevance and error blocks; abstains by default.
+    advisor: Arc<dyn Advisor>,
+    /// Value to placeholder table of the DLP stage.
+    vault: Arc<SecretVault>,
+    prune: Mutex<PruneSessions>,
 }
 
 fn share_saved(before: u64, after: u64) -> f64 {
@@ -53,6 +76,10 @@ impl Pipeline {
                     Stage::HtmlToMarkdown => cfg.html_to_markdown.enabled,
                     Stage::Headroom => cfg.headroom.enabled,
                     Stage::ContextGate => cfg.context_gate.enabled,
+                    Stage::Dlp => config.laya.dlp.enabled,
+                    Stage::Prune => config.laya.pruner.enabled,
+                    Stage::Triage => config.laya.triage.enabled,
+                    Stage::Rerank => config.laya.rerank.enabled,
                     _ => cfg.pxpipe.enabled,
                 };
                 (s, AtomicBool::new(on))
@@ -67,8 +94,25 @@ impl Pipeline {
             events,
             store,
             counters: RwLock::new(BTreeMap::new()),
+            laya: config.laya.clone(),
+            advisor: Arc::new(NoAdvisor),
+            vault: Arc::new(SecretVault::default()),
+            prune: Mutex::new(PruneSessions::default()),
             cfg,
         }
+    }
+
+    /// Uses `advisor` for DLP ambiguity, prune relevance, triage and rerank. The default
+    /// abstains, so every stage then keeps its native rule.
+    pub fn with_advisor(mut self, advisor: Arc<dyn Advisor>) -> Self {
+        self.advisor = advisor;
+        self
+    }
+
+    /// Uses `vault` for DLP placeholders, so the engine can restore values in tool inputs.
+    pub fn with_vault(mut self, vault: Arc<SecretVault>) -> Self {
+        self.vault = vault;
+        self
     }
 
     /// Providers whose counting endpoint measures the real size of original requests.
@@ -76,6 +120,7 @@ impl Pipeline {
         *self.counters.write().unwrap_or_else(|e| e.into_inner()) = providers;
     }
 
+    /// The current mode: active rewrites requests, observe only measures them.
     pub fn mode(&self) -> OptimizerMode {
         *self.mode.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -121,6 +166,29 @@ impl Pipeline {
             req.tolerate_history_edits();
         }
         m.duration_us = started.elapsed().as_micros() as u64;
+        self.emit(out, m);
+    }
+
+    /// DLP stage, first in the pipeline. It is a privacy control: it runs even when the
+    /// optimizer is disabled or in observe mode, and only its switch governs it. The proxy
+    /// agent is skipped because it cannot restore placeholders in the answer it forwards to
+    /// an external client, which would then see them.
+    async fn dlp_stage(&self, req: &mut ChatRequest, ctx: &OptimizeContext, out: &mut OptimizeOutcome) {
+        let switched_on = self.switches.get(&Stage::Dlp).is_some_and(|s| s.load(Ordering::Relaxed));
+        if ctx.agent_id == "proxy" || !switched_on {
+            return;
+        }
+        let started = Instant::now();
+        let report = redact_request(req, &self.vault, self.advisor.as_ref(), &self.laya.dlp).await;
+        let masked = report.secrets + report.pii;
+        let mut m = self.metric(Stage::Dlp, "request", "dlp:mask", ctx);
+        m.status = if masked > 0 { StageStatus::Applied } else { StageStatus::Skipped };
+        m.detail =
+            format!("{} secrets · {} personal values masked · {} ambiguous checked", report.secrets, report.pii, report.ambiguous_checked);
+        m.duration_us = started.elapsed().as_micros() as u64;
+        if masked > 0 {
+            self.events.emit(AppEvent::Redacted { agent_id: ctx.agent_id.clone(), secrets: report.secrets, pii: report.pii });
+        }
         self.emit(out, m);
     }
 
@@ -240,8 +308,11 @@ impl Pipeline {
 #[async_trait]
 impl RequestOptimizer for Pipeline {
     async fn optimize(&self, req: &mut ChatRequest, ctx: &OptimizeContext) -> OptimizeOutcome {
+        let mut out = OptimizeOutcome::default();
+        self.dlp_stage(req, ctx, &mut out).await;
         let est_before = estimate_request(req, true);
-        let mut out = OptimizeOutcome { est_before, est_after: est_before, ..OptimizeOutcome::default() };
+        out.est_before = est_before;
+        out.est_after = est_before;
         if !self.cfg.enabled {
             return out;
         }
@@ -251,6 +322,9 @@ impl RequestOptimizer for Pipeline {
             if let Some(p) = counter {
                 out.real_before = p.count_tokens(req).await;
             }
+        }
+        if self.on(Stage::Prune) {
+            self.prune_stage(req, ctx, mode, &mut out).await;
         }
         if self.on(Stage::Headroom) {
             if self.cfg.headroom.mode == "external" {
@@ -280,6 +354,14 @@ impl RequestOptimizer for Pipeline {
         }
         out.est_after = estimate_request(req, true);
         out
+    }
+
+    async fn after_tool(&self, tool: &str, _input: &serde_json::Value, output: &mut ToolOutput, goal: &str, ctx: &OptimizeContext) {
+        self.shorten_tool_output(tool, output, goal, ctx).await;
+    }
+
+    fn forget_session(&self, session_id: &str) {
+        self.prune.lock().unwrap_or_else(|e| e.into_inner()).forget(session_id);
     }
 
     fn record_usage(&self, ctx: &OptimizeContext, outcome: &OptimizeOutcome, usage: &Usage) {
@@ -360,8 +442,12 @@ impl RequestOptimizer for Pipeline {
         }
         let flag = |s: Stage| if self.on(s) { "on" } else { "off" };
         format!(
-            "optimizer: {:?} · rtk {} · html→md {} · headroom {} ({}) · gate {} ({} policy) · pxpipe {} ({}) · count_tokens {}",
+            "optimizer: {:?} · dlp {} · prune {} · triage {} · rerank {} · rtk {} · html→md {} · headroom {} ({}) · gate {} ({} policy) · pxpipe {} ({}) · count_tokens {}",
             self.mode(),
+            flag(Stage::Dlp),
+            flag(Stage::Prune),
+            flag(Stage::Triage),
+            flag(Stage::Rerank),
             flag(Stage::Rtk),
             flag(Stage::HtmlToMarkdown),
             flag(Stage::Headroom),
@@ -391,6 +477,9 @@ impl ContentFilter for Pipeline {
         convert_html(html, url, self.cfg.html_to_markdown.max_chars)
     }
 }
+
+mod prune;
+mod tool_output;
 
 #[cfg(test)]
 mod tests;

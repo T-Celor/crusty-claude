@@ -5,10 +5,13 @@
 //! hermetic.
 
 pub mod agents;
+pub mod checkpoint;
 pub mod commands;
 pub mod frontmatter;
 pub mod hooks;
 pub mod memory;
+pub mod plugins;
+pub mod skills;
 pub mod transcript;
 
 use std::fs;

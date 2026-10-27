@@ -9,6 +9,7 @@ use std::path::PathBuf;
 pub mod client;
 pub mod config;
 pub mod convert;
+pub mod sse;
 pub mod tool;
 
 pub use client::{McpManager, McpServerStatus};

@@ -27,8 +27,13 @@ crusty-session = { workspace = true }
 crusty-agent = { workspace = true }
 crusty-proxy = { workspace = true }
 crusty-tui = { workspace = true }
+crusty-sandbox = { workspace = true }
+crusty-advisor = { workspace = true }
+crusty-laya = { workspace = true }
+crusty-acp = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -5,13 +5,16 @@
 //! keeps working.
 
 pub mod app;
+pub mod complete;
 pub mod input;
+pub mod logo;
 pub mod markdown;
 pub mod panel;
 pub mod theme;
 pub mod ui;
 
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,6 +98,7 @@ pub async fn run(
     let mut keys = EventStream::new();
     let mut ticker = tokio::time::interval(tick);
     let mut dirty = true;
+    let mut index_task = Some(spawn_index(&opts.cwd));
 
     if let Some(prompt) = opts.initial_prompt.as_deref()
         && !send_all(&commands, app.submit_text(prompt))
@@ -114,9 +118,18 @@ pub async fn run(
             break;
         }
         tokio::select! {
+            files = wait_index(&mut index_task) => {
+                index_task = None;
+                app.set_file_index(files);
+                dirty = true;
+            },
             maybe = keys.next() => match maybe {
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
-                    if !send_all(&commands, app.handle_key(key)) {
+                    let cmds = app.handle_key(key);
+                    if app.take_index_refresh() {
+                        index_task = Some(spawn_index(&opts.cwd));
+                    }
+                    if !send_all(&commands, cmds) {
                         break;
                     }
                     dirty = true;
@@ -145,6 +158,20 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// Builds the `@` file index in the background.
+fn spawn_index(cwd: &str) -> tokio::task::JoinHandle<Vec<String>> {
+    let root = PathBuf::from(cwd);
+    tokio::task::spawn_blocking(move || complete::build_index(&root))
+}
+
+/// Waits for the index build; pends forever once it has been taken.
+async fn wait_index(task: &mut Option<tokio::task::JoinHandle<Vec<String>>>) -> Vec<String> {
+    match task.as_mut() {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => std::future::pending().await,
+    }
 }
 
 /// Sends every command; false when the session has gone away.

@@ -36,6 +36,11 @@ impl Editor {
         self.text.is_empty()
     }
 
+    /// Submitted prompts, oldest first.
+    pub fn history(&self) -> &[String] {
+        &self.history
+    }
+
     /// Cursor position as a char index.
     pub fn cursor(&self) -> usize {
         self.cursor

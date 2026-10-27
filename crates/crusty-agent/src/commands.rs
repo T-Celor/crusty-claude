@@ -2,6 +2,7 @@
 
 use std::fmt::Write as _;
 
+use crusty_core::checkpoint::RewindScope;
 use crusty_core::config::{ModelOverride, OptimizerMode, ProxyUpstream};
 use crusty_core::event::{Stage, TodoStatus};
 use crusty_core::tokens::{estimate_blocks, estimate_messages};
@@ -33,6 +34,9 @@ const BUILTIN: &[(&str, &str)] = &[
     ("review", "Review the current changes [target]"),
     ("mcp", "MCP servers and their tools"),
     ("status", "Session, models, modes and integrations"),
+    ("skills", "Skills the agents can load with the Skill tool"),
+    ("plugins", "Loaded plugins"),
+    ("rewind", "Checkpoints: list | <id> [code|conversation|both] (restore files and/or conversation)"),
     ("resume", "Resume a saved session [id]"),
     ("sessions", "List saved sessions"),
     ("export", "Export the conversation to Markdown [file]"),
@@ -60,7 +64,7 @@ pub fn command_list(custom: &[CustomCommand]) -> Vec<(String, String)> {
 
 /// Commands that change or read the conversation wait for the running turn.
 pub(crate) fn needs_idle(name: &str, custom: &[CustomCommand]) -> bool {
-    matches!(name, "clear" | "compact" | "resume" | "init" | "review" | "context" | "export" | "graph")
+    matches!(name, "clear" | "compact" | "resume" | "init" | "review" | "context" | "export" | "graph" | "rewind")
         || custom.iter().any(|c| c.name == name)
 }
 
@@ -196,6 +200,9 @@ pub(crate) async fn handle(ctl: &mut Controller, name: &str, args: &str) {
             out(&rt, name, if lines.is_empty() { "no MCP servers configured".to_owned() } else { lines.join("\n") });
         }
         "status" => out(&rt, name, status(&rt)),
+        "skills" => out(&rt, name, list_or(rt.context().skills, "no skills")),
+        "plugins" => out(&rt, name, list_or(rt.context().plugins, "no plugins")),
+        "rewind" => rewind(ctl, &words).await,
         "sessions" => out(&rt, name, list_sessions(&rt)),
         "resume" => match words.first() {
             None => out(&rt, name, list_sessions(&rt)),
@@ -265,6 +272,84 @@ pub(crate) async fn handle(ctl: &mut Controller, name: &str, args: &str) {
     }
 }
 
+fn list_or(items: Vec<String>, empty: &str) -> String {
+    if items.is_empty() { empty.to_owned() } else { items.join("\n") }
+}
+
+/// `/rewind` lists the checkpoints (the UI shows a picker); `/rewind <id> [scope]` restores
+/// the files, the conversation or both (default). Refused while a turn runs.
+async fn rewind(ctl: &mut Controller, words: &[&str]) {
+    let rt = ctl.rt.clone();
+    let Some(&id_arg) = words.first() else {
+        rt.events.emit(AppEvent::CheckpointList { items: rt.checkpoints.list() });
+        return;
+    };
+    if ctl.busy() {
+        rt.events.error("rewind refused while a turn is running");
+        return;
+    }
+    let Ok(id) = id_arg.trim_start_matches('#').parse::<u32>() else {
+        rt.events.error(format!("`{id_arg}` is not a checkpoint id (see /rewind)"));
+        return;
+    };
+    let scope = match words.get(1) {
+        None => RewindScope::Both,
+        Some(s) => match RewindScope::parse(s) {
+            Some(scope) => scope,
+            None => {
+                rt.events.error(format!("unknown scope `{s}` (code, conversation or both)"));
+                return;
+            }
+        },
+    };
+    let Some(index) = rt.checkpoints.list().iter().find(|c| c.id == id).map(|c| c.message_index) else {
+        rt.events.error(format!("no checkpoint {id} (see /rewind)"));
+        return;
+    };
+    // The stored message index no longer matches the compacted conversation.
+    if scope.restores_conversation() && id <= rt.compacted_through_checkpoint() {
+        rt.events.error(format!(
+            "checkpoint {id}: the conversation was compacted after this checkpoint; only `code` can be rewound (`/rewind {id} code`)"
+        ));
+        return;
+    }
+    let (mut files_restored, mut failures) = (0, Vec::new());
+    if scope.restores_code() {
+        match rt.checkpoints.rewind(id) {
+            Ok(report) => {
+                files_restored = report.files_restored;
+                failures = report.failures;
+            }
+            Err(e) => {
+                rt.events.error(format!("rewind failed: {e}"));
+                return;
+            }
+        }
+    }
+    if scope.restores_conversation() {
+        let mut convo = ctl.convo.lock().await;
+        let keep = index.min(convo.len());
+        convo.truncate(keep);
+        rt.clear_plans();
+        rt.forget_conversation(&[rt.session_id().as_str()]);
+        rt.log(&transcript::Entry::Rewind { keep_messages: keep, ts: chrono::Utc::now() });
+    }
+    rt.events.emit(AppEvent::Rewound { id, scope, files_restored, failures });
+}
+
+/// What the router and the user decided about the orchestrator model.
+fn route_note(rt: &Runtime) -> String {
+    let s = rt.settings();
+    if s.orchestrator_pinned {
+        "pinned by /model (`/model auto` lets the router choose)".into()
+    } else {
+        match s.routed_tier {
+            Some(tier) => format!("routed to the {tier} tier"),
+            None => "not routed yet (the router picks at the next prompt)".into(),
+        }
+    }
+}
+
 fn help(custom: &[CustomCommand]) -> String {
     let mut text = String::from("Commands:\n");
     for (n, d) in BUILTIN {
@@ -289,10 +374,24 @@ fn set_model(rt: &Runtime, words: &[&str]) {
         out(
             rt,
             "model",
-            format!("orchestrator: {}:{} (effort {})", current.provider, current.model, current.effort.as_deref().unwrap_or("default")),
+            format!(
+                "orchestrator: {}:{} (effort {}) · {}",
+                current.provider,
+                current.model,
+                current.effort.as_deref().unwrap_or("default"),
+                route_note(rt)
+            ),
         );
         return;
     };
+    if *arg == "auto" {
+        rt.update_settings(|s| {
+            s.orchestrator_pinned = false;
+            s.routed_tier = None;
+        });
+        out(rt, "model", "model routing on: the router picks the model at the next prompt");
+        return;
+    }
     let Some(mref) = ModelRef::parse(arg, &current.provider) else {
         rt.events.error(format!("bad model `{arg}` (use provider:model)"));
         return;
@@ -306,6 +405,7 @@ fn set_model(rt: &Runtime, words: &[&str]) {
         return;
     }
     rt.update_settings(|s| {
+        s.orchestrator_pinned = true;
         s.orchestrator.provider.clone_from(&mref.provider);
         s.orchestrator.model.clone_from(&mref.model);
         if effort.is_some() {
@@ -414,20 +514,24 @@ fn cost(rt: &Runtime) -> String {
 fn status(rt: &Runtime) -> String {
     let s = rt.settings();
     let ctx = rt.context();
+    let deferred = rt.deferred_servers();
     format!(
-        "Crusty-Claude {}\nsession: {}\nworkspace: {}\norchestrator: {}:{}\npermission mode: {}\n{}\nponytail: {} ({})\nmemory files: {}\nMCP servers: {}\ntools: {}",
+        "Crusty-Claude {}\nsession: {}\nworkspace: {}\norchestrator: {}:{} ({})\npermission mode: {}\n{}\nponytail: {} ({})\nmemory files: {}\nMCP servers: {}\ntools: {}\nadvisor: {}\ndeferred MCP servers: {}",
         env!("CARGO_PKG_VERSION"),
         rt.session_id(),
         display_path(&rt.workspace),
         s.orchestrator.provider,
         s.orchestrator.model,
+        route_note(rt),
         rt.permissions.mode(),
         rt.optimizer.describe(),
         s.ponytail.level,
         if s.ponytail.enabled { "on" } else { "off" },
         ctx.memory_files.len(),
         ctx.mcp_status.len(),
-        rt.tools.len()
+        rt.tools.len(),
+        rt.advisor.name(),
+        if deferred.is_empty() { "none".to_owned() } else { deferred.into_iter().collect::<Vec<_>>().join(", ") }
     )
 }
 

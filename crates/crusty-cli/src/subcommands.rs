@@ -1,5 +1,6 @@
-//! `crusty proxy | graph | config | doctor | sessions | mcp | models`.
+//! `crusty proxy | graph | config | doctor | sessions | mcp | models | plugin`.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,11 +9,13 @@ use crusty_agent::{display_path, find_in_path};
 use crusty_core::config::Config;
 use crusty_core::{AppEvent, CancellationToken, EventSink, OriginalStore, RequestOptimizer, StageStatus};
 use crusty_graph::CodeGraph;
+use crusty_laya::LayaClient;
 use crusty_pipeline::Pipeline;
 use crusty_providers::{ProviderRegistry, http_client};
+use crusty_session::plugins::{install_from_dir, install_from_git, list as list_plugins, remove as remove_plugin};
 
 use crate::wiring::{Loaded, load_config, print_sessions};
-use crate::{Cli, Command, ConfigAction, GraphAction};
+use crate::{Cli, Command, ConfigAction, GraphAction, PluginAction};
 
 /// Commented example written by `crusty config init`.
 pub const EXAMPLE_CONFIG: &str = include_str!("../../../config/config.example.toml");
@@ -22,7 +25,8 @@ pub async fn run(cli: &Cli, cmd: &Command) -> Result<i32> {
         Command::Proxy { listen, forward, live } => proxy(cli, listen.as_deref(), forward.as_deref(), *live).await,
         Command::Graph { action } => graph(cli, action).await,
         Command::Config { action } => config(cli, action),
-        Command::Doctor => doctor(cli),
+        Command::Doctor => doctor(cli).await,
+        Command::Plugin { action } => plugin(action),
         Command::Trust { remove } => {
             let workspace = match &cli.cwd {
                 Some(p) => p.clone(),
@@ -46,6 +50,15 @@ pub async fn run(cli: &Cli, cmd: &Command) -> Result<i32> {
         }
         Command::Mcp => mcp(cli).await,
         Command::Models { provider } => models(cli, provider.as_deref()).await,
+        Command::Acp => crate::acp::run(cli).await,
+        Command::JobExec { command } => match command.split_first() {
+            Some((program, args)) => crate::sandbox_exec::run_in_job(program, args),
+            None => bail!("__job-exec needs a program"),
+        },
+        Command::SandboxExec { policy, command } => match command.split_first() {
+            Some((program, args)) => crate::sandbox_exec::run(policy, program, args),
+            None => bail!("__sandbox-exec needs a program"),
+        },
     }
 }
 
@@ -232,8 +245,40 @@ fn config(cli: &Cli, action: &ConfigAction) -> Result<i32> {
     Ok(0)
 }
 
-fn doctor(cli: &Cli) -> Result<i32> {
-    let Loaded { config, workspace, sources, warnings, trusted, .. } = load_config(cli)?;
+/// `crusty plugin list | install | remove`. Installing copies files only; plugin code never runs.
+fn plugin(action: &PluginAction) -> Result<i32> {
+    let home = crusty_core::paths::home_dir();
+    match action {
+        PluginAction::List => {
+            let plugins = list_plugins(&home);
+            if plugins.is_empty() {
+                println!("no plugins installed in {}", display_path(&home.join(".crusty/plugins")));
+            }
+            for p in plugins {
+                println!("{} {}  {}", p.name, p.version, p.description);
+            }
+        }
+        PluginAction::Install { source, force } => {
+            let path = Path::new(source);
+            let installed = if path.is_dir() {
+                install_from_dir(path, &home, *force)
+            } else {
+                let git = crusty_agent::find_in_path("git").context("git is needed to install from a URL")?;
+                install_from_git(source, &home, &git, *force)
+            };
+            let p = installed.map_err(anyhow::Error::msg)?;
+            println!("installed plugin {} {}", p.name, p.version);
+        }
+        PluginAction::Remove { name } => {
+            remove_plugin(name, &home).map_err(anyhow::Error::msg)?;
+            println!("removed plugin {name}");
+        }
+    }
+    Ok(0)
+}
+
+async fn doctor(cli: &Cli) -> Result<i32> {
+    let Loaded { config, workspace, sources, warnings, trusted, home, .. } = load_config(cli)?;
     println!(
         "Crusty-Claude {} · project {} ({})",
         env!("CARGO_PKG_VERSION"),
@@ -276,6 +321,29 @@ fn doctor(cli: &Cli) -> Result<i32> {
         println!("  {bin:<9} {}", find_in_path(bin).map(|p| display_path(&p)).unwrap_or_else(|| "not found".into()));
     }
     println!("MCP servers in config: {}", config.mcp.servers.len());
+    if config.laya.enabled {
+        match LayaClient::new(&config.laya, http_client(5)).health().await {
+            Ok(h) => println!(
+                "advisor: laya {} up ({} ms{}); native fallback",
+                config.laya.url,
+                h.latency_ms,
+                h.detail.map(|d| format!(", {d}")).unwrap_or_default()
+            ),
+            Err(e) => println!("laya {} unavailable ({e}); using the native advisor", config.laya.url),
+        }
+    } else {
+        println!("advisor: native");
+    }
+    let sandbox = crusty_sandbox::detect(&config.sandbox);
+    println!("sandbox: {} ({})", sandbox.backend.name(), sandbox.detail);
+    let plugins = if config.plugins.enabled {
+        crusty_session::plugins::load_plugins(&workspace, &home, trusted, &config.plugins.disabled).0
+    } else {
+        Vec::new()
+    };
+    let (skills, _) = crate::extensions::discover_skills(&config, &workspace, &home, &plugins, trusted);
+    println!("skills: {}", skills.len());
+    println!("plugins: {}", plugins.len());
     println!("proxies: {}", config.proxy.upstreams.iter().map(|u| format!("{} {}", u.name, u.url)).collect::<Vec<_>>().join(", "));
     println!("transcripts: {}", display_path(&crusty_core::paths::sessions_dir(&workspace, config.session.dir.as_deref())));
     if missing_key {

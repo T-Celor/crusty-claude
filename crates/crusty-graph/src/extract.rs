@@ -1,7 +1,10 @@
-//! Regex extractors: definitions and imports per language. Heuristic by design (no parser),
-//! so unusual formatting can be missed or misread.
+//! Extraction entry points and the regex extractors: definitions, imports and identifiers per
+//! language. [`extract_file`] and [`extract`] first try the tree-sitter extractor in
+//! [`crate::treesitter`] (when the `tree-sitter` feature is on) and fall back to the regex
+//! extractor here for languages without a grammar. The regex extractor has no parser, so
+//! unusual formatting can be missed or misread.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -40,6 +43,8 @@ pub struct Import {
 pub struct Extracted {
     pub definitions: Vec<Definition>,
     pub imports: Vec<Import>,
+    /// Identifier-like tokens, used to infer reference edges between files.
+    pub identifiers: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -107,14 +112,47 @@ const GO_BLOCK_IMPORT: &str = r##"^\s*(?:[\w.]+\s+)?"([^"]+)""##;
 
 static SPECS: LazyLock<BTreeMap<&'static str, Spec>> = LazyLock::new(build_specs);
 static GO_BLOCK: LazyLock<Regex> = LazyLock::new(|| rx(GO_BLOCK_IMPORT));
+static IDENTIFIER: LazyLock<Regex> = LazyLock::new(|| rx(r"[A-Za-z_][A-Za-z0-9_]{3,}"));
 
-/// Extracts definitions (only when `want_defs`) and imports of `source`, written in `lang`.
-/// Unknown languages yield nothing.
+/// Extracts definitions (only when `want_defs`), imports and identifiers of `source`, written in
+/// `lang`. Languages with a tree-sitter grammar use it; others use the regex extractor. Unknown
+/// languages yield no definitions or imports.
 pub fn extract(lang: &str, source: &str, want_defs: bool) -> Extracted {
+    extract_source(lang, false, source, want_defs)
+}
+
+/// Like [`extract`], for the file at repository-relative path `rel`. A `.tsx` file is parsed with
+/// the TSX grammar, which accepts JSX.
+pub fn extract_file(rel: &str, lang: &str, source: &str, want_defs: bool) -> Extracted {
+    let tsx = rel.to_ascii_lowercase().ends_with(".tsx");
+    extract_source(lang, tsx, source, want_defs)
+}
+
+fn extract_source(lang: &str, tsx: bool, source: &str, want_defs: bool) -> Extracted {
+    if let Some(out) = tree_sitter_extract(lang, tsx, source, want_defs) {
+        return out;
+    }
+    extract_regex(lang, source, want_defs)
+}
+
+#[cfg(feature = "tree-sitter")]
+fn tree_sitter_extract(lang: &str, tsx: bool, source: &str, want_defs: bool) -> Option<Extracted> {
+    crate::treesitter::extract(lang, tsx, source, want_defs)
+}
+
+#[cfg(not(feature = "tree-sitter"))]
+fn tree_sitter_extract(_lang: &str, _tsx: bool, _source: &str, _want_defs: bool) -> Option<Extracted> {
+    None
+}
+
+/// The regex extractor: one line at a time, no parser. Used when no tree-sitter grammar covers
+/// the language, and for every language when the `tree-sitter` feature is off.
+pub(crate) fn extract_regex(lang: &str, source: &str, want_defs: bool) -> Extracted {
+    let identifiers = IDENTIFIER.find_iter(source).map(|m| m.as_str().to_owned()).collect();
     let Some(spec) = SPECS.get(lang) else {
-        return Extracted::default();
+        return Extracted { identifiers, ..Extracted::default() };
     };
-    let mut out = Extracted::default();
+    let mut out = Extracted { identifiers, ..Extracted::default() };
     let mut in_go_block = false;
     for (index, line) in source.lines().enumerate() {
         let line_no = u32::try_from(index + 1).unwrap_or(u32::MAX);
@@ -171,7 +209,8 @@ pub fn extract(lang: &str, source: &str, want_defs: bool) -> Extracted {
     out
 }
 
-fn push_import(out: &mut Extracted, raw: &str, kind: ImportKind, line: u32) {
+/// Adds an import unless its trimmed module path is empty (such as `from . import x`).
+pub(crate) fn push_import(out: &mut Extracted, raw: &str, kind: ImportKind, line: u32) {
     let module = raw.trim().trim_end_matches(&['.', ':'][..]);
     if !module.is_empty() {
         out.imports.push(Import { module: module.to_owned(), kind, line });

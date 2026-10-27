@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 unicode-width = { workspace = true }
+ignore = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

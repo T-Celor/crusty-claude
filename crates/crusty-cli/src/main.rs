@@ -1,6 +1,9 @@
 //! `crusty`: the Crusty-Claude command line.
 
+mod acp;
+mod extensions;
 mod print_mode;
+mod sandbox_exec;
 mod subcommands;
 mod wiring;
 
@@ -24,7 +27,7 @@ pub enum ModeArg {
 
 /// Crusty-Claude: a multi-provider, multi-agent coding agent for the terminal.
 /// The main agent is always an orchestrator that delegates to executor agents.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(name = "crusty", version, about, long_about = None)]
 pub struct Cli {
     /// Prompt: submitted at start in interactive mode, or answered with --print.
@@ -123,7 +126,7 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum Command {
     /// Run the built-in optimizing proxy (Anthropic-compatible) for any client.
     Proxy {
@@ -165,9 +168,49 @@ pub enum Command {
         /// Provider id (default: the orchestrator's).
         provider: Option<String>,
     },
+    /// Internal: run a command in a kill-on-close job (re-entered by the Windows sandbox).
+    #[command(name = "__job-exec", hide = true)]
+    JobExec {
+        /// The program and its arguments, after `--`.
+        #[arg(last = true, required = true, allow_hyphen_values = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// Internal: run a command under the Landlock policy (re-entered by the sandbox).
+    #[command(name = "__sandbox-exec", hide = true)]
+    SandboxExec {
+        /// Policy JSON, as serialized by the sandbox crate.
+        #[arg(long)]
+        policy: String,
+        /// The program and its arguments, after `--`.
+        #[arg(last = true, required = true, allow_hyphen_values = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// Manage plugins: list, install, remove.
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
+    /// Serve the Agent Client Protocol on stdio, for editors (Zed, JetBrains, Neovim, Emacs).
+    Acp,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
+pub enum PluginAction {
+    /// List installed plugins.
+    List,
+    /// Install from a git URL (https:// or git@) or a local folder. Plugin code never runs.
+    Install {
+        /// Git URL or folder.
+        source: String,
+        /// Replace an installed plugin of the same name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove an installed plugin.
+    Remove { name: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
 pub enum GraphAction {
     /// Build or refresh the graph.
     Build,
@@ -181,7 +224,7 @@ pub enum GraphAction {
     Report,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum ConfigAction {
     /// Print the effective configuration.
     Show,

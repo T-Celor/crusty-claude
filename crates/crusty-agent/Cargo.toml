@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 crusty-core = { workspace = true }
 crusty-session = { workspace = true }
+crusty-dlp = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

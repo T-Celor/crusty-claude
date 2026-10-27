@@ -83,6 +83,10 @@ impl Provider for OpenAiProvider {
         Ok(acc.finish(&req.model, on_delta))
     }
 
+    async fn count_tokens(&self, req: &ChatRequest) -> Option<u64> {
+        crate::tokenize::count_openai(&req.model, req)
+    }
+
     async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
         let base = resolve_base(&CallOptions::default(), &self.cfg)?;
         let resp = self.decorate(self.http.get(format!("{base}/models")), &[]).send().await.map_err(map_reqwest)?;
