@@ -1,0 +1,23 @@
+[package]
+name = "crusty-pipeline"
+description = "Request optimization pipeline: Headroom, then the Context Gate, then pxpipe, with live metrics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crusty-core = { workspace = true }
+crusty-optimizer = { workspace = true }
+crusty-gate = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

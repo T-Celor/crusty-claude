@@ -1,0 +1,42 @@
+[package]
+name = "crusty-cli"
+description = "Crusty-Claude: a multi-provider, multi-agent coding agent for the terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "crusty"
+
+[[bin]]
+name = "crusty"
+path = "src/main.rs"
+
+[dependencies]
+crusty-core = { workspace = true }
+crusty-providers = { workspace = true }
+crusty-tools = { workspace = true }
+crusty-shell = { workspace = true }
+crusty-web = { workspace = true }
+crusty-optimizer = { workspace = true }
+crusty-gate = { workspace = true }
+crusty-pipeline = { workspace = true }
+crusty-graph = { workspace = true }
+crusty-mcp = { workspace = true }
+crusty-session = { workspace = true }
+crusty-agent = { workspace = true }
+crusty-proxy = { workspace = true }
+crusty-tui = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,89 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/T-Celor/crusty-claude"
+authors = ["T-Celor"]
+
+[workspace.dependencies]
+# internal crates
+crusty-core = { path = "crates/crusty-core" }
+crusty-providers = { path = "crates/crusty-providers" }
+crusty-tools = { path = "crates/crusty-tools" }
+crusty-shell = { path = "crates/crusty-shell" }
+crusty-web = { path = "crates/crusty-web" }
+crusty-optimizer = { path = "crates/crusty-optimizer" }
+crusty-gate = { path = "crates/crusty-gate" }
+crusty-pipeline = { path = "crates/crusty-pipeline" }
+crusty-graph = { path = "crates/crusty-graph" }
+crusty-mcp = { path = "crates/crusty-mcp" }
+crusty-session = { path = "crates/crusty-session" }
+crusty-agent = { path = "crates/crusty-agent" }
+crusty-proxy = { path = "crates/crusty-proxy" }
+crusty-tui = { path = "crates/crusty-tui" }
+
+# async runtime
+tokio = { version = "1.54", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+base64 = "0.22"
+regex = "1"
+
+# filesystem
+dirs = "6"
+ignore = "0.4"
+globset = "0.4"
+tempfile = "3"
+
+# network (native TLS only: no C toolchain needed on Windows)
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "charset", "system-proxy", "json", "stream", "query", "gzip", "brotli", "deflate"] }
+url = "2"
+axum = "0.8"
+wiremock = "0.6"
+
+# optimizers
+html-to-markdown-rs = "3.18"
+png = "0.18"
+noto-sans-mono-bitmap = "0.3"
+
+# MCP (official Rust SDK)
+rmcp = { version = "3.7", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-native-tls"] }
+
+# TUI / CLI
+ratatui = "0.30"
+crossterm = "0.29"
+unicode-width = "0.2"
+clap = { version = "4.6", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+similar = "2"
+shlex = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

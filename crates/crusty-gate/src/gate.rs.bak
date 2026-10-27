@@ -1,0 +1,889 @@
+//! Routing policy of the context gate: text or pxpipe images, per request.
+//!
+//! The policy is deterministic. Time is passed in, and a dry run is supplied by the caller,
+//! so the same inputs always give the same decision and no I/O happens here. A request is
+//! decided in two steps: [`ContextGate::pre_decide`] returns a final decision or asks for a
+//! dry run; the caller measures the pxpipe saving and calls [`ContextGate::finish`].
+
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+use crusty_core::config::ContextGateConfig;
+use crusty_core::event::GateInfo;
+use serde::Serialize;
+
+/// A cached dry run is reused for this many requests of the session.
+const DRY_RUN_REUSE_REQUESTS: u64 = 5;
+/// A cached dry run is re-measured once the prompt measure grew by 10% (integer test).
+/// Predictions needed before the adaptive margin applies.
+const MIN_PREDICTIONS: u64 = 3;
+/// Most the adaptive margin adds to the configured one.
+const MAX_ADAPTIVE_MARGIN: f64 = 0.5;
+/// Bounds of the calibration factor (real over estimated prompt size).
+const CALIBRATION_MIN: f64 = 0.25;
+const CALIBRATION_MAX: f64 = 4.0;
+/// Zone boundaries, as shares of the window.
+const ZONE_MID_FROM: f64 = 0.2;
+const ZONE_HIGH_FROM: f64 = 0.5;
+const ZONE_LIMIT_FROM: f64 = 0.85;
+
+/// Where a request is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateRoute {
+    /// Plain text to the provider.
+    Direct,
+    /// Old context imaged by pxpipe.
+    Pxpipe,
+}
+
+impl fmt::Display for GateRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            GateRoute::Direct => "direct",
+            GateRoute::Pxpipe => "pxpipe",
+        })
+    }
+}
+
+/// Share of the window the prompt fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zone {
+    /// Too small for imaging to matter.
+    Low,
+    /// Imaging may pay off; the economics decide.
+    Mid,
+    /// Imaging pays off whenever it saves anything.
+    High,
+    /// Close to the window: imaging is preferred when it saves.
+    Limit,
+}
+
+impl fmt::Display for Zone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Zone::Low => "low",
+            Zone::Mid => "mid",
+            Zone::High => "high",
+            Zone::Limit => "limit",
+        })
+    }
+}
+
+/// What the gate knows about one request before deciding.
+#[derive(Debug, Clone, Copy)]
+pub struct GateInput<'a> {
+    /// Conversation key: calibration, stickiness and the dry-run cache are per session.
+    pub session: &'a str,
+    /// Estimated prompt tokens of the request as it would be sent as text.
+    pub est: u64,
+    /// Context window of the model; `ContextGateConfig::window` overrides it.
+    pub window: u64,
+    /// False when the model, provider or configuration cannot take images.
+    pub pxpipe_allowed: bool,
+}
+
+/// Result of [`ContextGate::pre_decide`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreDecision {
+    /// The route is known.
+    Final(GateDecision),
+    /// A dry run is needed; pass its result to [`ContextGate::finish`].
+    NeedDryRun {
+        /// Calibrated prompt size the dry run should be compared with.
+        measure: u64,
+        /// Zone of `measure`.
+        zone: Zone,
+    },
+}
+
+/// Outcome of a pxpipe dry run on the request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DryRun {
+    /// The dry run ran.
+    Measured {
+        /// Tokens the transform would save, before calibration.
+        saving: i64,
+        /// Share of precision-critical tokens in the imaged text.
+        verbatim_risk: f64,
+        /// Whether the transform would be applied at all.
+        applied: bool,
+        /// Reason reported by the transform.
+        reason: String,
+    },
+    /// The dry run failed.
+    Failed(String),
+    /// No renderer is available.
+    Unavailable,
+}
+
+/// A routing decision with the numbers behind it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateDecision {
+    /// Route taken.
+    pub route: GateRoute,
+    /// Why this route was taken.
+    pub reason: String,
+    /// Zone, when the request had a window position.
+    pub zone: Option<Zone>,
+    /// Estimated prompt tokens.
+    pub est: u64,
+    /// Calibrated prompt tokens.
+    pub measure: u64,
+    /// Whether the session had a calibration.
+    pub calibrated: bool,
+    /// Calibrated tokens the dry run would save.
+    pub saving: Option<i64>,
+    /// Economics: text cost minus pxpipe cost.
+    pub delta: Option<f64>,
+    /// Economics: cost of sending the text.
+    pub text_cost: Option<f64>,
+    /// Economics: cost of sending the images.
+    pub pxpipe_cost: Option<f64>,
+    /// Predicted prompt size when routed to pxpipe.
+    pub predicted_after: Option<u64>,
+    /// Duration of the dry run.
+    pub dryrun_ms: Option<u64>,
+    /// Share of precision-critical tokens in the imaged content.
+    pub verbatim_risk: Option<f64>,
+}
+
+impl GateDecision {
+    /// Converts the decision into the event sent to the UI and logs.
+    pub fn to_info(&self, session: &str, agent_id: &str, policy: &str, applied: bool) -> GateInfo {
+        GateInfo {
+            session: session.to_owned(),
+            agent_id: agent_id.to_owned(),
+            policy: policy.to_owned(),
+            route: self.route.to_string(),
+            reason: self.reason.clone(),
+            zone: self.zone.map(|z| z.to_string()),
+            est: self.est,
+            measure: self.measure,
+            calibrated: self.calibrated,
+            saving: self.saving,
+            delta: self.delta,
+            text_cost: self.text_cost,
+            pxpipe_cost: self.pxpipe_cost,
+            predicted_after: self.predicted_after,
+            dryrun_ms: self.dryrun_ms,
+            verbatim_risk: self.verbatim_risk,
+            applied,
+        }
+    }
+}
+
+/// Cost comparison of text against pxpipe over the session horizon.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Econ {
+    /// `text_cost - pxpipe_cost`; positive means pxpipe is cheaper.
+    pub delta: f64,
+    /// Cost of sending the whole prompt as text.
+    pub text_cost: f64,
+    /// Cost of sending the imaged prompt, including its overhead.
+    pub pxpipe_cost: f64,
+}
+
+/// Compares the cost of sending a prompt of `p` tokens as text with sending it imaged, where
+/// `s` tokens are saved by the imaging.
+pub fn economics(p: f64, s: f64, cfg: &ContextGateConfig) -> Econ {
+    let horizon = cfg.horizon as f64;
+    let text_cost = horizon * cfg.cache_read * p;
+    let reduced = p - s;
+    let pxpipe_cost = cfg.cache_write * reduced + horizon * cfg.cache_read * reduced * (1.0 + cfg.overhead);
+    Econ { delta: text_cost - pxpipe_cost, text_cost, pxpipe_cost }
+}
+
+/// Counters of the gate, for the side panel and logs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct GateStats {
+    /// Requests routed as text.
+    pub direct: u64,
+    /// Requests routed to pxpipe.
+    pub pxpipe: u64,
+    /// Sessions currently stuck to pxpipe.
+    pub sticky_sessions: usize,
+    /// Sessions with a calibration.
+    pub calibrated_sessions: usize,
+    /// Dry runs that ran (measured or failed).
+    pub dryruns: u64,
+    /// Predictions recorded for pxpipe requests.
+    pub predictions: u64,
+    /// Sum of |real - predicted| over the predictions.
+    pub prediction_abs_error_sum: u64,
+    /// True while the pxpipe circuit breaker is open.
+    pub breaker_open: bool,
+}
+
+/// Per-session state, bounded by `max_sessions`.
+#[derive(Debug, Default)]
+struct Session {
+    requests: u64,
+    /// `(real prompt, estimate)` of the last direct answer.
+    calibration: Option<(u64, u64)>,
+    sticky: bool,
+    dry: Option<CachedDry>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedDry {
+    measure: u64,
+    at_request: u64,
+    dry: DryRun,
+}
+
+#[derive(Debug, Default)]
+struct Breaker {
+    consecutive: u32,
+    open_until: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    sessions: HashMap<String, Session>,
+    /// Insertion order of `sessions`; sticky sessions move to the back on every hit.
+    order: VecDeque<String>,
+    breaker: Breaker,
+    stats: GateStats,
+    /// Sum of predicted prompt sizes, the denominator of the adaptive margin.
+    predicted_sum: u64,
+}
+
+/// Prompt size and zone of one request, shared by every decision it produces.
+#[derive(Debug, Clone, Copy)]
+struct Ctx {
+    est: u64,
+    measure: u64,
+    calibrated: bool,
+    zone: Zone,
+}
+
+impl Ctx {
+    fn draft(self, route: GateRoute, reason: &str) -> GateDecision {
+        GateDecision {
+            route,
+            reason: reason.to_owned(),
+            zone: Some(self.zone),
+            est: self.est,
+            measure: self.measure,
+            calibrated: self.calibrated,
+            saving: None,
+            delta: None,
+            text_cost: None,
+            pxpipe_cost: None,
+            predicted_after: None,
+            dryrun_ms: None,
+            verbatim_risk: None,
+        }
+    }
+}
+
+/// The gate: routing policy plus the state it needs across requests.
+#[derive(Debug)]
+pub struct ContextGate {
+    cfg: ContextGateConfig,
+    state: Mutex<Inner>,
+}
+
+impl ContextGate {
+    /// A gate with fresh state.
+    pub fn new(cfg: ContextGateConfig) -> Self {
+        ContextGate { cfg, state: Mutex::new(Inner::default()) }
+    }
+
+    /// The configuration the gate was built with.
+    pub fn config(&self) -> &ContextGateConfig {
+        &self.cfg
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn window_of(&self, input: &GateInput<'_>) -> u64 {
+        self.cfg.window.unwrap_or(input.window).max(1)
+    }
+
+    /// First step of a decision. Returns the route when it is known without a dry run,
+    /// otherwise asks for one. The lock is not held by the caller across a dry run.
+    pub fn pre_decide(&self, input: &GateInput<'_>, now: Instant) -> PreDecision {
+        let cfg = &self.cfg;
+        let window = self.window_of(input);
+        let mut st = self.lock();
+        let (measure, calibrated, requests, sticky, cached) = {
+            let s = session_entry(&mut st, input.session, cfg.max_sessions);
+            s.requests += 1;
+            let (measure, calibrated) = measure_of(s.calibration, input.est);
+            (measure, calibrated, s.requests, s.sticky, s.dry.clone())
+        };
+        let zone = zone_of(measure, window);
+        let c = Ctx { est: input.est, measure, calibrated, zone };
+
+        if !cfg.enabled {
+            return PreDecision::Final(self.conclude(&mut st, input.session, c.draft(GateRoute::Direct, "disabled")));
+        }
+        if !input.pxpipe_allowed {
+            return PreDecision::Final(self.conclude(&mut st, input.session, c.draft(GateRoute::Direct, "model_not_allowed")));
+        }
+        if let Some(until) = st.breaker.open_until {
+            if now < until {
+                return PreDecision::Final(self.conclude(&mut st, input.session, c.draft(GateRoute::Direct, "breaker_open")));
+            }
+            st.breaker = Breaker::default();
+        }
+        if sticky {
+            // Leaving pxpipe is decided here; the next request is evaluated from scratch.
+            if (measure as f64) < cfg.unstick_ratio * window as f64 {
+                if let Some(s) = st.sessions.get_mut(input.session) {
+                    s.sticky = false;
+                }
+                return PreDecision::Final(self.conclude(&mut st, input.session, c.draft(GateRoute::Direct, "unstuck")));
+            }
+            return PreDecision::Final(self.conclude(&mut st, input.session, c.draft(GateRoute::Pxpipe, "sticky")));
+        }
+        if cfg.policy == "threshold" {
+            let d = if measure >= cfg.min_tokens {
+                c.draft(GateRoute::Pxpipe, "above")
+            } else {
+                c.draft(GateRoute::Direct, "below")
+            };
+            return PreDecision::Final(self.conclude(&mut st, input.session, d));
+        }
+        if zone == Zone::Low {
+            return PreDecision::Final(self.conclude(&mut st, input.session, c.draft(GateRoute::Direct, "zone_low")));
+        }
+        if let Some(dry) = fresh_dry(&cached, measure, requests) {
+            let d = self.evaluate(&st, c, &dry, None, true);
+            return PreDecision::Final(self.conclude(&mut st, input.session, d));
+        }
+        PreDecision::NeedDryRun { measure, zone }
+    }
+
+    /// Second step: decides from the dry run and caches it for the session.
+    /// `measure` and `zone` come from the matching [`PreDecision::NeedDryRun`].
+    pub fn finish(
+        &self,
+        input: &GateInput<'_>,
+        measure: u64,
+        zone: Zone,
+        dry: DryRun,
+        dryrun_ms: Option<u64>,
+        _now: Instant,
+    ) -> GateDecision {
+        let mut st = self.lock();
+        let calibrated = {
+            let s = session_entry(&mut st, input.session, self.cfg.max_sessions);
+            if matches!(dry, DryRun::Measured { .. }) {
+                s.dry = Some(CachedDry { measure, at_request: s.requests, dry: dry.clone() });
+            }
+            s.calibration.is_some()
+        };
+        if matches!(dry, DryRun::Measured { .. } | DryRun::Failed(_)) {
+            st.stats.dryruns += 1;
+        }
+        let c = Ctx { est: input.est, measure, calibrated, zone };
+        let d = self.evaluate(&st, c, &dry, dryrun_ms, false);
+        self.conclude(&mut st, input.session, d)
+    }
+
+    /// Feeds back what a request really cost. Direct answers calibrate the session's size
+    /// estimate; pxpipe answers only feed the prediction statistics.
+    pub fn record_usage(&self, session: &str, route: GateRoute, est: u64, real_context: u64, predicted_after: Option<u64>) {
+        let mut st = self.lock();
+        {
+            let s = session_entry(&mut st, session, self.cfg.max_sessions);
+            if route == GateRoute::Direct && est > 0 {
+                s.calibration = Some((real_context, est));
+            }
+        }
+        if let (GateRoute::Pxpipe, Some(predicted)) = (route, predicted_after) {
+            st.stats.predictions += 1;
+            st.predicted_sum += predicted;
+            st.stats.prediction_abs_error_sum += real_context.abs_diff(predicted);
+        }
+    }
+
+    /// A pxpipe request failed. After `breaker_failures` in a row pxpipe is off for the
+    /// cooldown, and the session leaves pxpipe.
+    pub fn record_pxpipe_failure(&self, session: &str, now: Instant) {
+        let mut st = self.lock();
+        st.breaker.consecutive = st.breaker.consecutive.saturating_add(1);
+        if st.breaker.consecutive >= self.cfg.breaker_failures.max(1) {
+            let cooldown = Duration::from_secs(self.cfg.breaker_cooldown_secs);
+            st.breaker.open_until = Some(now + cooldown);
+            tracing::warn!(failures = st.breaker.consecutive, "pxpipe circuit breaker opened");
+        }
+        if let Some(s) = st.sessions.get_mut(session) {
+            s.sticky = false;
+        }
+    }
+
+    /// A pxpipe request succeeded: the failure streak ends.
+    pub fn record_pxpipe_success(&self) {
+        self.lock().breaker = Breaker::default();
+    }
+
+    /// Current counters.
+    pub fn stats(&self) -> GateStats {
+        let st = self.lock();
+        GateStats {
+            sticky_sessions: st.sessions.values().filter(|s| s.sticky).count(),
+            calibrated_sessions: st.sessions.values().filter(|s| s.calibration.is_some()).count(),
+            breaker_open: st.breaker.open_until.is_some(),
+            ..st.stats
+        }
+    }
+
+    /// Final decision for a request whose dry run result is known.
+    fn evaluate(&self, st: &Inner, c: Ctx, dry: &DryRun, dryrun_ms: Option<u64>, cached: bool) -> GateDecision {
+        let cfg = &self.cfg;
+        let (saving, verbatim_risk, applied, reason) = match dry {
+            DryRun::Measured { saving, verbatim_risk, applied, reason } => (*saving, *verbatim_risk, *applied, reason.as_str()),
+            DryRun::Failed(_) => return c.draft(GateRoute::Direct, "dryrun_error"),
+            DryRun::Unavailable => {
+                let route = if c.measure >= cfg.min_tokens { GateRoute::Pxpipe } else { GateRoute::Direct };
+                return c.draft(route, "lib_missing");
+            }
+        };
+        let scale = if c.est > 0 { c.measure as f64 / c.est as f64 } else { 1.0 };
+        let saving_s = (saving as f64 * scale).round() as i64;
+        let mut d = c.draft(GateRoute::Direct, "");
+        d.dryrun_ms = dryrun_ms;
+        d.verbatim_risk = Some(verbatim_risk);
+        d.saving = Some(saving_s);
+
+        let (route, why): (GateRoute, String) = if !applied {
+            (GateRoute::Direct, format!("pxpipe_{reason}"))
+        } else if saving_s <= 0 {
+            (GateRoute::Direct, "no_saving".to_owned())
+        } else if verbatim_risk > cfg.max_verbatim_risk {
+            (GateRoute::Direct, "verbatim_risk".to_owned())
+        } else if (saving_s as u64) < cfg.min_saving_tokens {
+            (GateRoute::Direct, "saving_too_small".to_owned())
+        } else {
+            let econ = economics(c.measure as f64, saving_s as f64, cfg);
+            d.delta = Some(econ.delta);
+            d.text_cost = Some(econ.text_cost);
+            d.pxpipe_cost = Some(econ.pxpipe_cost);
+            let margin = self.margin(st);
+            let (route, why) = match c.zone {
+                Zone::Limit => (GateRoute::Pxpipe, "near_limit"),
+                Zone::High if econ.delta > 0.0 => (GateRoute::Pxpipe, "gain_high"),
+                Zone::Mid if econ.delta > margin * econ.text_cost => (GateRoute::Pxpipe, "gain"),
+                Zone::Low => (GateRoute::Direct, "zone_low"),
+                Zone::High | Zone::Mid => (GateRoute::Direct, "not_worth_yet"),
+            };
+            (route, why.to_owned())
+        };
+        d.route = route;
+        if route == GateRoute::Pxpipe {
+            d.predicted_after = Some(c.measure.saturating_sub(saving_s as u64));
+        }
+        d.reason = if cached { format!("{why}_cached") } else { why };
+        d
+    }
+
+    /// Configured margin, raised by the observed prediction error once enough predictions exist.
+    fn margin(&self, st: &Inner) -> f64 {
+        let n = st.stats.predictions;
+        if n >= MIN_PREDICTIONS && st.predicted_sum > 0 {
+            let error = st.stats.prediction_abs_error_sum as f64 / st.predicted_sum as f64;
+            self.cfg.margin + error.min(MAX_ADAPTIVE_MARGIN)
+        } else {
+            self.cfg.margin
+        }
+    }
+
+    /// Records a route in the counters and the stickiness of the session.
+    fn conclude(&self, st: &mut Inner, session: &str, d: GateDecision) -> GateDecision {
+        match d.route {
+            GateRoute::Direct => st.stats.direct += 1,
+            GateRoute::Pxpipe => {
+                st.stats.pxpipe += 1;
+                if self.cfg.sticky
+                    && let Some(s) = st.sessions.get_mut(session)
+                {
+                    s.sticky = true;
+                }
+            }
+        }
+        d
+    }
+}
+
+/// Session entry, created on first use. Sticky sessions move to the back of the eviction
+/// order on every hit, so only idle non-sticky sessions are evicted first.
+fn session_entry<'a>(st: &'a mut Inner, key: &str, max_sessions: usize) -> &'a mut Session {
+    if st.sessions.contains_key(key) {
+        if st.sessions.get(key).is_some_and(|s| s.sticky)
+            && let Some(pos) = st.order.iter().position(|k| k.as_str() == key)
+            && let Some(k) = st.order.remove(pos)
+        {
+            st.order.push_back(k);
+        }
+    } else {
+        while st.sessions.len() >= max_sessions.max(1) {
+            let Some(oldest) = st.order.pop_front() else { break };
+            st.sessions.remove(&oldest);
+        }
+        st.order.push_back(key.to_owned());
+    }
+    st.sessions.entry(key.to_owned()).or_default()
+}
+
+/// Calibrated prompt size and whether a calibration was applied.
+fn measure_of(calibration: Option<(u64, u64)>, est: u64) -> (u64, bool) {
+    match calibration {
+        Some((real, prev_est)) if prev_est > 0 => {
+            let factor = (real as f64 / prev_est as f64).clamp(CALIBRATION_MIN, CALIBRATION_MAX);
+            ((est as f64 * factor).round() as u64, true)
+        }
+        _ => (est, false),
+    }
+}
+
+fn zone_of(measure: u64, window: u64) -> Zone {
+    let ratio = measure as f64 / window as f64;
+    if ratio < ZONE_MID_FROM {
+        Zone::Low
+    } else if ratio < ZONE_HIGH_FROM {
+        Zone::Mid
+    } else if ratio < ZONE_LIMIT_FROM {
+        Zone::High
+    } else {
+        Zone::Limit
+    }
+}
+
+/// The cached dry run, if it still applies: the measure has not grown by the re-measure
+/// factor and fewer than `DRY_RUN_REUSE_REQUESTS` requests have passed.
+fn fresh_dry(cached: &Option<CachedDry>, measure: u64, requests: u64) -> Option<DryRun> {
+    let c = cached.as_ref()?;
+    let grew = measure * 10 >= c.measure * 11;
+    let stale = requests.saturating_sub(c.at_request) >= DRY_RUN_REUSE_REQUESTS;
+    (!grew && !stale).then(|| c.dry.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const W: u64 = 200_000;
+
+    fn gate(cfg: ContextGateConfig) -> ContextGate {
+        ContextGate::new(cfg)
+    }
+
+    fn input(session: &str, est: u64) -> GateInput<'_> {
+        GateInput { session, est, window: W, pxpipe_allowed: true }
+    }
+
+    fn measured(saving: i64, verbatim_risk: f64) -> DryRun {
+        DryRun::Measured { saving, verbatim_risk, applied: true, reason: "ok".into() }
+    }
+
+    /// Full two-step decision, with `dry` answering the dry run if one is needed.
+    fn decide(g: &ContextGate, inp: &GateInput<'_>, dry: DryRun) -> GateDecision {
+        let now = Instant::now();
+        match g.pre_decide(inp, now) {
+            PreDecision::Final(d) => d,
+            PreDecision::NeedDryRun { measure, zone } => g.finish(inp, measure, zone, dry, Some(3), now),
+        }
+    }
+
+    fn final_of(p: PreDecision) -> GateDecision {
+        match p {
+            PreDecision::Final(d) => d,
+            other => panic!("expected a final decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn economics_matches_hand_computation() {
+        let e = economics(100_000.0, 40_000.0, &ContextGateConfig::default());
+        assert!((e.text_cost - 200_000.0).abs() < 1e-6);
+        assert!((e.pxpipe_cost - 219_000.0).abs() < 1e-6);
+        assert!((e.delta - -19_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn small_prompt_stays_text() {
+        let g = gate(ContextGateConfig::default());
+        let d = final_of(g.pre_decide(&input("s", 10_000), Instant::now()));
+        assert_eq!((d.route, d.reason.as_str(), d.zone), (GateRoute::Direct, "zone_low", Some(Zone::Low)));
+    }
+
+    #[test]
+    fn near_limit_routes_to_pxpipe_and_predicts() {
+        let g = gate(ContextGateConfig::default());
+        let d = decide(&g, &input("s", 180_000), measured(60_000, 0.0));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Pxpipe, "near_limit"));
+        assert_eq!(d.predicted_after, Some(120_000));
+        assert_eq!(d.dryrun_ms, Some(3));
+    }
+
+    #[test]
+    fn mid_zone_needs_delta_above_margin() {
+        // P=60000: delta is 3200 for S=28000 (below 5% of text cost 120000 = 6000).
+        let g = gate(ContextGateConfig::default());
+        let d = decide(&g, &input("a", 60_000), measured(28_000, 0.0));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "not_worth_yet"));
+        assert!((d.delta.unwrap_or(f64::NAN) - 3_200.0).abs() < 1e-6);
+
+        let g = gate(ContextGateConfig::default());
+        let d = decide(&g, &input("b", 60_000), measured(30_000, 0.0));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Pxpipe, "gain"));
+
+        let no_margin = gate(ContextGateConfig { margin: 0.0, ..ContextGateConfig::default() });
+        let d = decide(&no_margin, &input("c", 60_000), measured(28_000, 0.0));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Pxpipe, "gain"));
+    }
+
+    #[test]
+    fn high_zone_needs_positive_delta() {
+        let g = gate(ContextGateConfig::default());
+        let d = decide(&g, &input("a", 100_000), measured(60_000, 0.0));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Pxpipe, "gain_high"));
+        let d = decide(&g, &input("b", 100_000), measured(30_000, 0.0));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "not_worth_yet"));
+    }
+
+    #[test]
+    fn no_saving_and_unapplied_transform_stay_text() {
+        let g = gate(ContextGateConfig::default());
+        let d = decide(&g, &input("a", 100_000), measured(0, 0.0));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "no_saving"));
+
+        let g = gate(ContextGateConfig::default());
+        let not_applied = DryRun::Measured { saving: 60_000, verbatim_risk: 0.0, applied: false, reason: "no_eligible_blocks".into() };
+        let d = decide(&g, &input("a", 100_000), not_applied);
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "pxpipe_no_eligible_blocks"));
+    }
+
+    #[test]
+    fn threshold_policy_uses_size_only() {
+        let g = gate(ContextGateConfig { policy: "threshold".into(), ..ContextGateConfig::default() });
+        let d = final_of(g.pre_decide(&input("a", 70_000), Instant::now()));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Pxpipe, "above"));
+        let d = final_of(g.pre_decide(&input("b", 50_000), Instant::now()));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "below"));
+    }
+
+    #[test]
+    fn pxpipe_session_stays_sticky() {
+        let g = gate(ContextGateConfig::default());
+        let d = decide(&g, &input("s", 100_000), measured(60_000, 0.0));
+        assert_eq!(d.route, GateRoute::Pxpipe);
+        let d = final_of(g.pre_decide(&input("s", 100_000), Instant::now()));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Pxpipe, "sticky"));
+        assert_eq!(g.stats().sticky_sessions, 1);
+
+        let g = gate(ContextGateConfig { sticky: false, ..ContextGateConfig::default() });
+        decide(&g, &input("s", 100_000), measured(60_000, 0.0));
+        assert!(matches!(g.pre_decide(&input("s", 100_000), Instant::now()), PreDecision::NeedDryRun { .. }));
+    }
+
+    #[test]
+    fn direct_answers_calibrate_within_clamp() {
+        let g = gate(ContextGateConfig::default());
+        g.record_usage("c", GateRoute::Direct, 10_000, 40_000, None);
+        match g.pre_decide(&input("c", 10_000), Instant::now()) {
+            PreDecision::NeedDryRun { measure, zone } => {
+                assert_eq!(measure, 40_000);
+                assert_eq!(zone, Zone::Mid);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // A factor of 0.1 is clamped to 0.25.
+        g.record_usage("d", GateRoute::Direct, 10_000, 1_000, None);
+        let d = final_of(g.pre_decide(&input("d", 10_000), Instant::now()));
+        assert_eq!((d.measure, d.calibrated), (2_500, true));
+    }
+
+    #[test]
+    fn only_direct_answers_calibrate() {
+        let g = gate(ContextGateConfig::default());
+        g.record_usage("p", GateRoute::Pxpipe, 10_000, 40_000, Some(9_000));
+        let d = final_of(g.pre_decide(&input("p", 10_000), Instant::now()));
+        assert_eq!((d.measure, d.calibrated), (10_000, false));
+    }
+
+    #[test]
+    fn dry_run_reused_then_remeasured() {
+        let g = gate(ContextGateConfig { sticky: false, ..ContextGateConfig::default() });
+        let d = decide(&g, &input("s", 100_000), measured(60_000, 0.0));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Pxpipe, "gain_high"));
+
+        // Requests 2..=5 reuse the dry run (fewer than 5 requests since it was measured).
+        for _ in 0..4 {
+            let d = final_of(g.pre_decide(&input("s", 100_000), Instant::now()));
+            assert_eq!(d.reason, "gain_high_cached");
+        }
+        assert_eq!(g.stats().dryruns, 1);
+        // The sixth request measures again.
+        assert!(matches!(g.pre_decide(&input("s", 100_000), Instant::now()), PreDecision::NeedDryRun { .. }));
+
+        // A growth of 10% or more also forces a new dry run.
+        let g = gate(ContextGateConfig { sticky: false, ..ContextGateConfig::default() });
+        decide(&g, &input("t", 100_000), measured(60_000, 0.0));
+        assert!(matches!(g.pre_decide(&input("t", 110_000), Instant::now()), PreDecision::NeedDryRun { .. }));
+    }
+
+    #[test]
+    fn unavailable_renderer_falls_back_to_threshold() {
+        let g = gate(ContextGateConfig::default());
+        let now = Instant::now();
+        let mid_big = g.pre_decide(&input("a", 60_000), now);
+        let PreDecision::NeedDryRun { measure, zone } = mid_big else { panic!("dry run expected") };
+        let d = g.finish(&input("a", 60_000), measure, zone, DryRun::Unavailable, None, now);
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Pxpipe, "lib_missing"));
+
+        let d = g.finish(&input("b", 50_000), 50_000, Zone::Mid, DryRun::Unavailable, None, now);
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "lib_missing"));
+    }
+
+    #[test]
+    fn dry_run_error_stays_text() {
+        let g = gate(ContextGateConfig::default());
+        let d = g.finish(&input("a", 100_000), 100_000, Zone::High, DryRun::Failed("boom".into()), None, Instant::now());
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "dryrun_error"));
+        assert_eq!(g.stats().dryruns, 1);
+    }
+
+    #[test]
+    fn model_not_allowed_wins_before_any_measure() {
+        let g = gate(ContextGateConfig::default());
+        let inp = GateInput { session: "a", est: 180_000, window: W, pxpipe_allowed: false };
+        let d = final_of(g.pre_decide(&inp, Instant::now()));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "model_not_allowed"));
+    }
+
+    #[test]
+    fn verbatim_risk_blocks_pxpipe() {
+        let g = gate(ContextGateConfig::default());
+        let d = decide(&g, &input("a", 100_000), measured(60_000, 0.5));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "verbatim_risk"));
+        assert_eq!(d.verbatim_risk, Some(0.5));
+    }
+
+    #[test]
+    fn small_saving_is_refused() {
+        let g = gate(ContextGateConfig::default());
+        let d = decide(&g, &input("a", 100_000), measured(1_000, 0.0));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "saving_too_small"));
+    }
+
+    #[test]
+    fn breaker_opens_after_failures_and_closes_after_cooldown() {
+        let cfg = ContextGateConfig { breaker_failures: 2, breaker_cooldown_secs: 60, ..ContextGateConfig::default() };
+        let g = gate(cfg);
+        let t0 = Instant::now();
+        g.record_pxpipe_failure("a", t0);
+        assert!(!g.stats().breaker_open, "one failure is below the threshold");
+        g.record_pxpipe_failure("a", t0);
+        assert!(g.stats().breaker_open);
+
+        let d = final_of(g.pre_decide(&input("b", 180_000), t0 + Duration::from_secs(10)));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "breaker_open"));
+
+        let d = final_of(g.pre_decide(&input("b", 10_000), t0 + Duration::from_secs(61)));
+        assert_eq!(d.reason, "zone_low");
+        assert!(!g.stats().breaker_open);
+    }
+
+    #[test]
+    fn success_resets_the_failure_streak() {
+        let g = gate(ContextGateConfig { breaker_failures: 2, ..ContextGateConfig::default() });
+        let t0 = Instant::now();
+        g.record_pxpipe_failure("a", t0);
+        g.record_pxpipe_success();
+        g.record_pxpipe_failure("a", t0);
+        assert!(!g.stats().breaker_open);
+    }
+
+    #[test]
+    fn failure_unsticks_the_session() {
+        let g = gate(ContextGateConfig::default());
+        decide(&g, &input("s", 100_000), measured(60_000, 0.0));
+        g.record_pxpipe_failure("s", Instant::now());
+        assert!(matches!(g.pre_decide(&input("s", 100_000), Instant::now()), PreDecision::NeedDryRun { .. }));
+    }
+
+    #[test]
+    fn shrinking_prompt_unsticks_then_is_evaluated() {
+        let g = gate(ContextGateConfig::default());
+        decide(&g, &input("s", 100_000), measured(60_000, 0.0));
+        // 20 000 < 15% of the window: leaves pxpipe.
+        let d = final_of(g.pre_decide(&input("s", 20_000), Instant::now()));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "unstuck"));
+        let d = final_of(g.pre_decide(&input("s", 20_000), Instant::now()));
+        assert_eq!(d.reason, "zone_low");
+    }
+
+    #[test]
+    fn adaptive_margin_raises_the_bar_after_bad_predictions() {
+        let g = gate(ContextGateConfig::default());
+        for i in 0..3 {
+            g.record_usage(&format!("p{i}"), GateRoute::Pxpipe, 100_000, 150_000, Some(100_000));
+        }
+        // Error 50 000 on 100 000 predicted: the margin becomes 0.55, so 3 200 < 66 000 is refused.
+        let d = decide(&g, &input("m", 60_000), measured(28_000, 0.0));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "not_worth_yet"));
+        assert_eq!(g.stats().predictions, 3);
+
+        let g = gate(ContextGateConfig::default());
+        for i in 0..2 {
+            g.record_usage(&format!("p{i}"), GateRoute::Pxpipe, 100_000, 150_000, Some(100_000));
+        }
+        let d = decide(&g, &input("m", 60_000), measured(28_000, 0.0));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Pxpipe, "gain"));
+    }
+
+    #[test]
+    fn window_comes_from_input_unless_configured() {
+        let g = gate(ContextGateConfig::default());
+        let inp = GateInput { session: "a", est: 60_000, window: 100_000, pxpipe_allowed: true };
+        match g.pre_decide(&inp, Instant::now()) {
+            PreDecision::NeedDryRun { zone, .. } => assert_eq!(zone, Zone::High),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let g = gate(ContextGateConfig { window: Some(400_000), ..ContextGateConfig::default() });
+        let d = final_of(g.pre_decide(&inp, Instant::now()));
+        assert_eq!((d.route, d.reason.as_str()), (GateRoute::Direct, "zone_low"));
+    }
+
+    #[test]
+    fn bounded_sessions_keep_sticky_entries_on_hit() {
+        let g = gate(ContextGateConfig { max_sessions: 2, ..ContextGateConfig::default() });
+        let now = Instant::now();
+        decide(&g, &input("a", 100_000), measured(60_000, 0.0));
+        final_of(g.pre_decide(&input("b", 10_000), now));
+        // Hitting the sticky "a" moves it to the back, so inserting "c" evicts "b".
+        final_of(g.pre_decide(&input("a", 100_000), now));
+        final_of(g.pre_decide(&input("c", 10_000), now));
+        let d = final_of(g.pre_decide(&input("a", 100_000), now));
+        assert_eq!(d.reason, "sticky");
+        assert!(matches!(g.pre_decide(&input("b", 100_000), now), PreDecision::NeedDryRun { .. }));
+    }
+
+    #[test]
+    fn evicted_calibration_is_forgotten() {
+        let g = gate(ContextGateConfig { max_sessions: 1, ..ContextGateConfig::default() });
+        let now = Instant::now();
+        g.record_usage("old", GateRoute::Direct, 10_000, 40_000, None);
+        final_of(g.pre_decide(&input("new", 10_000), now));
+        let d = final_of(g.pre_decide(&input("old", 10_000), now));
+        assert_eq!((d.measure, d.calibrated), (10_000, false));
+    }
+
+    #[test]
+    fn to_info_carries_the_decision() {
+        let g = gate(ContextGateConfig::default());
+        let d = decide(&g, &input("s", 180_000), measured(60_000, 0.0));
+        let info = d.to_info("s", "agent", "gain", true);
+        assert_eq!((info.route.as_str(), info.zone.as_deref(), info.reason.as_str()), ("pxpipe", Some("limit"), "near_limit"));
+        assert_eq!((info.est, info.measure, info.saving, info.applied), (180_000, 180_000, Some(60_000), true));
+    }
+}

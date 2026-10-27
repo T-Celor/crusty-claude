@@ -1,0 +1,12 @@
+# Offline demo: every agent uses the scripted mock provider (no API key, no network).
+#   crusty --config config/offline.toml
+# The mock echoes the last prompt; it shows the UI, the side panel and the pipeline at work,
+# not a real model's behaviour.
+
+[orchestrator]
+provider = "mock"
+model = "mock"
+
+[executor]
+provider = "mock"
+model = "mock"
